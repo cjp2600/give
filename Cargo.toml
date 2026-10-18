@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 alacritty_terminal = "=0.25.1"
 portable-pty = "=0.9.0"
+serde_json = "1"
 tempfile = "3"
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 gpui-component = "=0.5.1"
@@ -21,11 +22,14 @@ raw-window-handle = "0.6"
 [build-dependencies]
 cc = "1"
 
-[dev-dependencies]
-serde_json = "1"
-
 [profile.dev]
 debug = 1
+opt-level = 1
+
+# GPUI layout, text shaping and syntect are far too slow unoptimized; `make run`
+# still rebuilds this crate quickly.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

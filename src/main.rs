@@ -85,19 +85,41 @@ actions!(
         SelectLeft,
         SelectRight,
         SelectUp,
-        SelectDown
+        SelectDown,
+        ReviewBranch,
+        ExitReview,
+        PickerUp,
+        PickerDown,
+        PickerCancel
     ]
 );
 
 fn main() {
-    let argument = std::env::args_os().nth(1);
-    if argument.as_deref() == Some(std::ffi::OsStr::new("--help")) {
-        println!(
-            "give [repository]\n\nNative Git review on GPUI. Without a path, open a repository from the welcome screen."
-        );
-        return;
+    let mut initial = None;
+    let mut review = None;
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
+        let text = argument.to_string_lossy();
+        if text == "--help" {
+            println!(
+                "give [repository] [--review <branch>]\n\nNative Git review on GPUI. Without a path, open a repository from the welcome screen.\n--review reviews a branch against main, like giv --review."
+            );
+            return;
+        } else if text == "--review" {
+            let Some(branch) = arguments.next() else {
+                eprintln!("--review needs a branch name");
+                std::process::exit(2);
+            };
+            review = Some(branch.to_string_lossy().into_owned());
+        } else if let Some(branch) = text.strip_prefix("--review=") {
+            review = Some(branch.to_owned());
+        } else {
+            initial = Some(PathBuf::from(argument));
+        }
     }
-    let initial = argument.map(PathBuf::from);
+    if review.is_some() && initial.is_none() {
+        initial = std::env::current_dir().ok();
+    }
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
@@ -176,6 +198,10 @@ fn main() {
                 KeyBinding::new("home", FirstRow, Some("Give && !Input && !Terminal")),
                 KeyBinding::new("end", LastRow, Some("Give && !Input && !Terminal")),
                 KeyBinding::new("secondary-shift-c", CopyDiff, Some("Give && !Terminal")),
+                KeyBinding::new("secondary-shift-r", ReviewBranch, Some("Give && !Terminal")),
+                KeyBinding::new("up", PickerUp, Some("BranchPicker > Input")),
+                KeyBinding::new("down", PickerDown, Some("BranchPicker > Input")),
+                KeyBinding::new("escape", PickerCancel, Some("BranchPicker")),
             ]);
             cx.set_menus(vec![
                 Menu {
@@ -203,6 +229,13 @@ fn main() {
                         MenuItem::action("Commit Staged Changes", Commit),
                     ],
                 },
+                Menu {
+                    name: "Review".into(),
+                    items: vec![
+                        MenuItem::action("Review Branch…", ReviewBranch),
+                        MenuItem::action("Exit Review", ExitReview),
+                    ],
+                },
             ]);
             let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
             let window = cx.open_window(
@@ -213,7 +246,8 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| ui::Give::new(initial, window, cx));
+                    let view =
+                        cx.new(|cx| ui::Give::new(initial.clone(), review.clone(), window, cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             );

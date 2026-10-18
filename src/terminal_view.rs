@@ -17,7 +17,10 @@ use std::{
 };
 
 const FONT_SIZE: f32 = 14.;
-const ROW_HEIGHT: f32 = 21.;
+/// About Menlo's own line height, so glyphs drawn by the font nearly touch.
+const ROW_HEIGHT: f32 = 17.;
+/// The grid keeps this width at any panel size; a narrower panel scrolls horizontally.
+const COLUMNS: u16 = 100;
 actions!(terminal, [TerminalCopy, TerminalPaste, TerminalSelectAll]);
 
 pub fn init(cx: &mut App) {
@@ -43,6 +46,10 @@ pub struct TerminalView {
     focus: FocusHandle,
     bounds: Rc<Cell<Bounds<Pixels>>>,
     cell_width: f32,
+    /// Horizontal offset of the grid inside a panel narrower than it, in pixels.
+    scroll_x: f32,
+    /// The cursor last brought into view; scrolling follows only its moves.
+    followed_cursor: Option<(usize, usize)>,
     size: Size,
     path: PathBuf,
     title: String,
@@ -84,10 +91,12 @@ impl TerminalView {
             focus,
             bounds: Rc::new(Cell::new(Bounds::default())),
             cell_width: 8.4,
+            scroll_x: 0.,
+            followed_cursor: None,
             size: Size {
                 rows: 32,
-                cols: 60,
-                pixel_width: 504,
+                cols: COLUMNS,
+                pixel_width: 1008,
                 pixel_height: 672,
             },
             path,
@@ -387,9 +396,31 @@ impl TerminalView {
             cx.stop_propagation();
         }
     }
+    /// Bring a moved cursor into view; manual scrolling stays put while it rests.
+    fn follow_cursor(&mut self, view_width: f32) {
+        let cursor = self
+            .frame
+            .as_ref()
+            .and_then(|frame| frame.cursor)
+            .map(|(row, column, _)| (row, column));
+        if cursor == self.followed_cursor {
+            return;
+        }
+        self.followed_cursor = cursor;
+        let Some((_, column)) = cursor else {
+            return;
+        };
+        let left = column as f32 * self.cell_width;
+        let right = left + self.cell_width;
+        if left < self.scroll_x {
+            self.scroll_x = left;
+        } else if right > self.scroll_x + view_width {
+            self.scroll_x = right - view_width;
+        }
+    }
     fn grid_point(&self, position: Point<Pixels>) -> (usize, usize, bool) {
         let bounds = self.bounds.get();
-        let x = (f32::from(position.x - bounds.left()) / self.cell_width).max(0.);
+        let x = ((f32::from(position.x - bounds.left()) + self.scroll_x) / self.cell_width).max(0.);
         let y = (f32::from(position.y - bounds.top()) / ROW_HEIGHT).max(0.);
         (
             y.floor().min(self.size.rows.saturating_sub(1) as f32) as usize,
@@ -501,6 +532,14 @@ impl TerminalView {
         self.poll(cx);
     }
     fn wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let delta = event.delta.pixel_delta(px(ROW_HEIGHT));
+        if delta.x.abs() > delta.y.abs() {
+            // Clamped against the panel width when the grid is next painted.
+            self.scroll_x = (self.scroll_x - f32::from(delta.x)).max(0.);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         self.wheel += f32::from(event.delta.pixel_delta(px(ROW_HEIGHT)).y) / ROW_HEIGHT;
         let lines = self.wheel.trunc() as i32;
         self.wheel -= lines as f32;
@@ -624,82 +663,102 @@ impl Render for TerminalView {
                     .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
                     .on_scroll_wheel(cx.listener(Self::wheel))
                     .child(
-                        canvas(
-                            move |bounds, window, cx| {
-                                bounds_cell.set(bounds);
-                                entity.update(cx, |this, _| {
-                                    let font = gpui::font("Menlo");
-                                    let run = TextRun {
-                                        len: 1,
-                                        font,
-                                        color: rgb(terminal::FOREGROUND).into(),
-                                        background_color: None,
-                                        underline: None,
-                                        strikethrough: None,
-                                    };
-                                    let line = window.text_system().shape_line(
-                                        "M".into(),
-                                        px(FONT_SIZE),
-                                        &[run],
-                                        None,
-                                    );
-                                    this.cell_width = f32::from(line.width).max(1.);
-                                    let size = Size {
-                                        rows: (f32::from(bounds.size.height) / ROW_HEIGHT)
-                                            .floor()
-                                            .max(1.)
-                                            as u16,
-                                        cols: (f32::from(bounds.size.width) / this.cell_width)
-                                            .floor()
-                                            .max(2.)
-                                            as u16,
-                                        pixel_width: f32::from(bounds.size.width).max(1.) as u16,
-                                        pixel_height: f32::from(bounds.size.height).max(1.) as u16,
-                                    };
-                                    if this.size != size {
-                                        this.size = size;
-                                        if let Some(terminal) = &this.terminal {
-                                            terminal.resize(size);
+                        div().size_full().overflow_hidden().child(
+                            canvas(
+                                move |bounds, window, cx| {
+                                    bounds_cell.set(bounds);
+                                    entity.update(cx, |this, _| {
+                                        let font = gpui::font("Menlo");
+                                        let run = TextRun {
+                                            len: 1,
+                                            font,
+                                            color: rgb(terminal::FOREGROUND).into(),
+                                            background_color: None,
+                                            underline: None,
+                                            strikethrough: None,
+                                        };
+                                        let line = window.text_system().shape_line(
+                                            "M".into(),
+                                            px(FONT_SIZE),
+                                            &[run],
+                                            None,
+                                        );
+                                        this.cell_width = f32::from(line.width).max(1.);
+                                        let grid_width = COLUMNS as f32 * this.cell_width;
+                                        let view_width = f32::from(bounds.size.width);
+                                        let size = Size {
+                                            rows: (f32::from(bounds.size.height) / ROW_HEIGHT)
+                                                .floor()
+                                                .max(1.)
+                                                as u16,
+                                            cols: COLUMNS,
+                                            pixel_width: grid_width as u16,
+                                            pixel_height: f32::from(bounds.size.height).max(1.)
+                                                as u16,
+                                        };
+                                        if this.size != size {
+                                            this.size = size;
+                                            if let Some(terminal) = &this.terminal {
+                                                terminal.resize(size);
+                                            }
                                         }
-                                    }
-                                    (
-                                        this.frame.clone(),
-                                        this.focus.is_focused(window),
-                                        this.blink,
-                                        this.preedit.clone(),
-                                        this.cell_width,
-                                        this.error.clone(),
-                                    )
-                                })
-                            },
-                            move |bounds,
-                                  (frame, focused, blink, preedit, cell_width, error),
-                                  window,
-                                  cx| {
-                                let focus = paint_entity.read(cx).focus.clone();
-                                window.handle_input(
-                                    &focus,
-                                    ElementInputHandler::new(bounds, paint_entity.clone()),
-                                    cx,
-                                );
-                                let Some(frame) = frame else {
-                                    if let Some(error) = error {
-                                        paint_message(&error, bounds.origin, window, cx);
-                                    }
-                                    return;
-                                };
-                                paint_frame(
-                                    &frame,
-                                    bounds,
+                                        this.follow_cursor(view_width);
+                                        this.scroll_x = this
+                                            .scroll_x
+                                            .clamp(0., (grid_width - view_width).max(0.));
+                                        (
+                                            this.frame.clone(),
+                                            this.focus.is_focused(window),
+                                            this.blink,
+                                            this.preedit.clone(),
+                                            this.cell_width,
+                                            this.error.clone(),
+                                            this.scroll_x,
+                                        )
+                                    })
+                                },
+                                move |bounds,
+                                      (
+                                    frame,
+                                    focused,
+                                    blink,
+                                    preedit,
                                     cell_width,
-                                    (focused, blink),
-                                    &preedit,
-                                    window,
-                                    cx,
-                                );
-                            },
-                        )
-                        .size_full(),
+                                    error,
+                                    scroll_x,
+                                ),
+                                      window,
+                                      cx| {
+                                    let focus = paint_entity.read(cx).focus.clone();
+                                    window.handle_input(
+                                        &focus,
+                                        ElementInputHandler::new(bounds, paint_entity.clone()),
+                                        cx,
+                                    );
+                                    let Some(frame) = frame else {
+                                        if let Some(error) = error {
+                                            paint_message(&error, bounds.origin, window, cx);
+                                        }
+                                        return;
+                                    };
+                                    let grid = Bounds::new(
+                                        point(bounds.left() - px(scroll_x), bounds.top()),
+                                        size(px(COLUMNS as f32 * cell_width), bounds.size.height),
+                                    );
+                                    paint_frame(
+                                        &frame,
+                                        grid,
+                                        cell_width,
+                                        (focused, blink),
+                                        &preedit,
+                                        window,
+                                        cx,
+                                    );
+                                    paint_scrollbar(bounds, grid, window);
+                                },
+                            )
+                            .size_full(),
+                        ),
                     ),
             )
             .child(
@@ -728,6 +787,23 @@ impl Render for TerminalView {
     }
 }
 
+/// A thin position bar under the grid while it is wider than the panel.
+fn paint_scrollbar(view: Bounds<Pixels>, grid: Bounds<Pixels>, window: &mut Window) {
+    let (view_width, grid_width) = (f32::from(view.size.width), f32::from(grid.size.width));
+    if grid_width <= view_width + 0.5 {
+        return;
+    }
+    let offset = f32::from(view.left() - grid.left());
+    let thumb = Bounds::new(
+        point(
+            view.left() + px(offset / grid_width * view_width),
+            view.bottom() - px(3.),
+        ),
+        size(px(view_width * view_width / grid_width), px(3.)),
+    );
+    window.paint_quad(fill(thumb, rgba(0x7a8da580)));
+}
+
 fn paint_message(text: &str, origin: Point<Pixels>, window: &mut Window, cx: &mut App) {
     let run = TextRun {
         len: text.len(),
@@ -741,6 +817,30 @@ fn paint_message(text: &str, origin: Point<Pixels>, window: &mut Window, cx: &mu
         .text_system()
         .shape_line(text.to_owned().into(), px(FONT_SIZE), &[run], None);
     let _ = line.paint(origin, px(ROW_HEIGHT), window, cx);
+}
+
+/// Rectangles snapped to device pixels, so neighbouring cells join without seams.
+fn paint_cell_rects(
+    rects: &[give::terminal_glyphs::Rect],
+    origin: Point<Pixels>,
+    color: u32,
+    window: &mut Window,
+) {
+    let scale = window.scale_factor().max(1.);
+    let snap = |value: f32| (value * scale).round() / scale;
+    let (left, top) = (f32::from(origin.x), f32::from(origin.y));
+    for rect in rects {
+        let x0 = snap(left + rect.x);
+        let y0 = snap(top + rect.y);
+        let x1 = snap(left + rect.x + rect.width).max(x0 + 1. / scale);
+        let y1 = snap(top + rect.y + rect.height).max(y0 + 1. / scale);
+        let mut fill_color = rgb(color);
+        fill_color.a = rect.alpha;
+        window.paint_quad(fill(
+            Bounds::new(point(px(x0), px(y0)), size(px(x1 - x0), px(y1 - y0))),
+            fill_color,
+        ));
+    }
 }
 
 fn paint_frame(
@@ -800,6 +900,13 @@ fn paint_frame(
             cell.foreground
         };
         if cell.text.is_empty() || cell.text == " " {
+            continue;
+        }
+        let mut chars = cell.text.chars();
+        if let (Some(c), None) = (chars.next(), chars.next())
+            && let Some(rects) = give::terminal_glyphs::rects(c, width, ROW_HEIGHT, 1.)
+        {
+            paint_cell_rects(&rects, position, foreground, window);
             continue;
         }
         let mut font = gpui::font("Menlo");
@@ -941,7 +1048,7 @@ impl EntityInputHandler for TerminalView {
         let bounds = self.bounds.get();
         Some(Bounds::new(
             point(
-                bounds.left() + px(col as f32 * self.cell_width),
+                bounds.left() + px(col as f32 * self.cell_width - self.scroll_x),
                 bounds.top() + px(row as f32 * ROW_HEIGHT),
             ),
             size(px(self.cell_width), px(ROW_HEIGHT)),

@@ -61,10 +61,18 @@ impl Slot {
     }
 
     pub fn load(&self, repo: &Repository, file: &ChangedFile) -> Result<Pair, String> {
+        self.load_with(|| repo.preview_pair(file))
+    }
+
+    /// Loads from another source, such as a branch review, with the same sharing.
+    pub fn load_with(
+        &self,
+        read: impl FnOnce() -> anyhow::Result<(Diff, Diff)>,
+    ) -> Result<Pair, String> {
         let result = self
             .content
             .get_or_init(|| {
-                repo.preview_pair(file)
+                read()
                     .map(|(normal, deletions)| {
                         let bytes = [&normal, &deletions]
                             .into_iter()

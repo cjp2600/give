@@ -8,12 +8,15 @@ pub struct Text {
     selected: String,
     sent_value: bool,
     sent_selection: bool,
+    /// Focus, visibility and frame last given to AppKit; unchanged frames skip the native call.
+    sent_state: Option<(bool, bool, Bounds<Pixels>, std::ops::Range<usize>)>,
     pub range: std::ops::Range<usize>,
 }
 impl Text {
     pub fn invalidate(&mut self) {
         self.sent_value = false;
         self.sent_selection = false;
+        self.sent_state = None;
     }
     pub fn set_value(&mut self, text: String) {
         if self.value != text {
@@ -37,6 +40,10 @@ impl Text {
         bounds: Bounds<Pixels>,
         window: &Window,
     ) {
+        let state = (focused, visible, bounds, self.range.clone());
+        if self.sent_value && self.sent_selection && self.sent_state.as_ref() == Some(&state) {
+            return;
+        }
         #[cfg(target_os = "macos")]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -72,6 +79,7 @@ impl Text {
             }
             self.sent_value = true;
             self.sent_selection = true;
+            self.sent_state = Some(state);
         }
     }
 }

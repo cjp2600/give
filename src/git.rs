@@ -493,7 +493,7 @@ pub fn parse_diff(raw: &str) -> Diff {
     diff
 }
 
-fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
+pub(crate) fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -515,18 +515,35 @@ fn read_bounded(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn run<I, S>(root: &Path, args: I, input: Option<&[u8]>, commit: bool) -> Result<Vec<u8>>
+pub(crate) fn run<I, S>(root: &Path, args: I, input: Option<&[u8]>, long: bool) -> Result<Vec<u8>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_LITERAL_PATHSPECS", "1")
-        .env("LC_ALL", "C")
+        .env("LC_ALL", "C");
+    execute(
+        command,
+        "Git",
+        input,
+        Duration::from_secs(if long { 120 } else { 15 }),
+    )
+}
+
+/// Bounded subprocess with a timeout; stdout and stderr drain concurrently.
+pub(crate) fn execute(
+    mut command: Command,
+    name: &str,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let mut child = command
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -535,7 +552,9 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Could not start Git. Install Git and make it available on PATH.")?;
+        .with_context(|| {
+            format!("Could not start {name}. Install {name} and make it available on PATH.")
+        })?;
     let stdout = child.stdout.take().context("Missing stdout")?;
     let stderr = child.stderr.take().context("Missing stderr")?;
     let out_thread = thread::spawn(move || read_bounded(stdout));
@@ -547,23 +566,30 @@ where
             .context("Missing stdin")?
             .write_all(input)?;
     }
-    let status = child.wait_timeout(Duration::from_secs(if commit { 120 } else { 15 }))?;
+    let status = child.wait_timeout(timeout)?;
     if status.is_none() {
         let _ = child.kill();
         let _ = child.wait();
     }
     let out = out_thread
         .join()
-        .map_err(|_| anyhow::anyhow!("Git output reader failed"))??;
+        .map_err(|_| anyhow::anyhow!("{name} output reader failed"))??;
     let err = err_thread
         .join()
-        .map_err(|_| anyhow::anyhow!("Git diagnostic reader failed"))??;
-    let status = status.context("Git operation timed out.")?;
+        .map_err(|_| anyhow::anyhow!("{name} diagnostic reader failed"))??;
+    let status = status.with_context(|| format!("{name} operation timed out."))?;
     if !status.success() {
-        bail!("{}", String::from_utf8_lossy(&err).trim());
+        let mut detail = String::from_utf8_lossy(&err).trim().to_owned();
+        if detail.is_empty() {
+            detail = String::from_utf8_lossy(&out).trim().to_owned();
+        }
+        if detail.is_empty() {
+            detail = format!("{name} exited with {status}");
+        }
+        bail!("{detail}");
     }
     if out.len() > OUTPUT_LIMIT {
-        bail!("Git output exceeds 4 MiB. Inspect this change in your editor.");
+        bail!("{name} output exceeds 4 MiB. Inspect this change in your editor.");
     }
     Ok(out)
 }

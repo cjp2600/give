@@ -1,12 +1,14 @@
 use crate::{
-    ActivateRow, CollapseRow, Commit, CopyDiff, CopySelection, ExpandRow, FirstRow, LastRow,
-    NextChange, NextFile, OpenRepository, PageDown, PageUp, PreviousFile, Refresh, SelectAllText,
-    SelectDown, SelectLeft, SelectRight, SelectUp, SwitchPane, ToggleDeletions, ToggleTerminal,
+    ActivateRow, CollapseRow, Commit, CopyDiff, CopySelection, ExitReview, ExpandRow, FirstRow,
+    LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerCancel, PickerDown,
+    PickerUp, PreviousFile, Refresh, ReviewBranch, SelectAllText, SelectDown, SelectLeft,
+    SelectRight, SelectUp, SwitchPane, ToggleDeletions, ToggleTerminal,
 };
 use give::{
     git::{ChangedFile, Diff, LineKind, Repository, Snapshot},
     preview,
     preview_cache::{Key, PreviewCache, Slot, Syntax},
+    review::{self, Branch, Review},
     scrollbar,
     text_selection::{self, Point as TextPoint, Selection as TextSelection},
     tree::{self, RowKind, TreeRow},
@@ -36,6 +38,11 @@ const MUTED: u32 = 0x7a8da5;
 const ACCENT: u32 = 0x87b1d7;
 const GREEN: u32 = 0x9ac9ad;
 const RED: u32 = 0xdb929d;
+// File-name colors by change kind, as in JetBrains IDEs.
+const NAME_MODIFIED: u32 = 0x7fb2ea;
+const NAME_ADDED: u32 = 0x8fd3a4;
+const NAME_DELETED: u32 = 0x75808c;
+const NAME_UNTRACKED: u32 = 0xe08e98;
 const LINE_HEIGHT: f32 = 26.;
 const TREE_HEIGHT: f32 = 27.;
 
@@ -60,6 +67,8 @@ pub struct Give {
     scrollbar_bounds: Rc<Cell<Bounds<Pixels>>>,
     scrollbar_drag: Option<f32>,
     changes: Arc<Vec<usize>>,
+    /// The longest preview row; the list measures its horizontal scroll width from it.
+    widest_line: usize,
     show_deletions: bool,
     preview_cursor: usize,
     text_selection: Option<TextSelection>,
@@ -91,15 +100,46 @@ pub struct Give {
     epoch: u64,
     snapshot_request: u64,
     preview_request: u64,
+    /// The branch under review, from the request until Exit review.
+    review_branch: Option<String>,
+    review: Option<Arc<Review>>,
+    /// Loader step while a review fetches and diffs.
+    review_step: Option<&'static str>,
+    review_error: Option<String>,
+    /// `--review` waits for the repository to open.
+    pending_review: Option<String>,
+    picker_open: bool,
+    picker_request: u64,
+    picker_note: Option<String>,
+    branches: Vec<Branch>,
+    branches_loading: bool,
+    branch_input: Entity<InputState>,
+    branch_query: String,
+    branch_cursor: usize,
+    branch_scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
+/// A branch picker row: a listed branch, or the typed name as given.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerRow {
+    Branch(usize),
+    Typed,
+}
+
 impl Give {
-    pub fn new(initial: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        initial: Option<PathBuf>,
+        review: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter changed files…"));
         let commit_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Describe your changes…"));
+        let branch_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Branch name, local or remote…"));
         let subscriptions = vec![
             cx.subscribe_in(&filter_input, window, |this, input, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -109,6 +149,20 @@ impl Give {
                 }
             }),
             cx.subscribe(&commit_input, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe_in(
+                &branch_input,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::Change => {
+                        this.branch_query = input.read(cx).value().trim().to_owned();
+                        this.branch_cursor = 0;
+                        this.branch_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => this.confirm_branch(window, cx),
+                    _ => {}
+                },
+            ),
         ];
         let focus = cx.focus_handle();
         focus.focus(window);
@@ -133,6 +187,7 @@ impl Give {
             scrollbar_bounds: Rc::new(Cell::new(Bounds::default())),
             scrollbar_drag: None,
             changes: Arc::default(),
+            widest_line: 0,
             show_deletions: false,
             preview_cursor: 0,
             text_selection: None,
@@ -164,6 +219,20 @@ impl Give {
             epoch: 0,
             snapshot_request: 0,
             preview_request: 0,
+            review_branch: None,
+            review: None,
+            review_step: None,
+            review_error: None,
+            pending_review: review,
+            picker_open: false,
+            picker_request: 0,
+            picker_note: None,
+            branches: Vec::new(),
+            branches_loading: false,
+            branch_input,
+            branch_query: String::new(),
+            branch_cursor: 0,
+            branch_scroll: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         cx.background_executor()
@@ -366,8 +435,18 @@ impl Give {
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         this.commit_input
                             .update(cx, |input, cx| input.set_value("", window, cx));
-                        this.rebuild_tree(false, cx);
+                        this.review_branch = None;
+                        this.review = None;
+                        this.review_step = None;
+                        this.review_error = None;
+                        this.close_picker(window, cx);
+                        this.reset_preview_position();
                         this.notice = "Watching local changes".into();
+                        if let Some(branch) = this.pending_review.take() {
+                            this.start_review(branch, window, cx);
+                        } else {
+                            this.rebuild_tree(false, cx);
+                        }
                     }
                     Err(error) => this.show_error(error, cx),
                 }
@@ -378,8 +457,17 @@ impl Give {
         cx.notify();
     }
 
+    /// ⌘R: reload the review (fetch included) or the working tree.
+    fn manual_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.review_branch.clone() {
+            Some(branch) => self.start_review(branch, window, cx),
+            None => self.refresh(cx),
+        }
+    }
+
+    /// Working-tree polling. A review compares fixed refs, so it is never polled.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.opening || self.refreshing {
+        if self.busy || self.opening || self.refreshing || self.review_branch.is_some() {
             return;
         }
         let Some(repo) = self.repo.clone() else {
@@ -469,9 +557,10 @@ impl Give {
         }
         let ready = slot.ready().is_some();
         let read_slot = slot.clone();
+        let review = self.review.clone();
         let read_task = (!ready).then(|| {
             cx.background_executor()
-                .spawn(async move { read_slot.load(&repo, &file) })
+                .spawn(async move { load_slot(&read_slot, &repo, &file, review.as_deref()) })
         });
         cx.spawn(async move |view, cx| {
             if let Some(task) = read_task {
@@ -542,6 +631,14 @@ impl Give {
         }
         self.diff = next;
         self.changes = Arc::new(scrollbar::changed_lines(&self.diff.lines));
+        // Tabs are expanded and the font is monospaced, so characters approximate width.
+        self.widest_line = self
+            .diff
+            .lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, line)| line.text.chars().count())
+            .map_or(0, |(index, _)| index);
         self.syntax = slot.styles(self.show_deletions).unwrap_or_default();
         self.preview_loading = false;
         self.preview_cursor = anchor
@@ -661,8 +758,9 @@ impl Give {
             self.prefetching.insert(key.clone());
             let epoch = self.epoch;
             let repo = repo.clone();
+            let review = self.review.clone();
             let task = cx.background_executor().spawn(async move {
-                if slot.load(&repo, &file).is_ok() {
+                if load_slot(&slot, &repo, &file, review.as_deref()).is_ok() {
                     slot.highlight_range(false, 0..48);
                 }
             });
@@ -825,7 +923,7 @@ impl Give {
     }
 
     fn mutate(&mut self, all: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.opening {
+        if self.busy || self.opening || self.review_branch.is_some() {
             return;
         }
         let Some(repo) = self.repo.clone() else {
@@ -864,7 +962,7 @@ impl Give {
     }
 
     fn commit(&mut self, _: &Commit, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.opening {
+        if self.busy || self.opening || self.review_branch.is_some() {
             return;
         }
         let Some(repo) = self.repo.clone() else {
@@ -934,6 +1032,251 @@ impl Give {
             });
         })
         .detach();
+    }
+
+    /// giv's review mode: fetch, then load the MR refs or the merge-base with main.
+    fn start_review(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        let branch = branch.trim().to_owned();
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if branch.is_empty() || self.busy || self.opening {
+            return;
+        }
+        self.close_picker(window, cx);
+        self.epoch += 1;
+        let epoch = self.epoch;
+        self.review_branch = Some(branch.clone());
+        self.review = None;
+        self.review_error = None;
+        self.review_step = Some("Fetching…");
+        self.refreshing = false;
+        self.preview_request += 1;
+        self.tree_request += 1;
+        self.tree_task = None;
+        self.cache = PreviewCache::default();
+        self.prefetching.clear();
+        self.syntax_pending.clear();
+        self.snapshot = Snapshot {
+            branch: branch.clone(),
+            ..Snapshot::default()
+        };
+        self.tree.clear();
+        self.tree_cursor = None;
+        self.collapsed.clear();
+        self.selected = None;
+        self.reset_preview_position();
+        self.focus_left = true;
+        self.notice = format!("Reviewing {branch}…");
+        self.error = false;
+        let fetch_repo = repo.clone();
+        let fetch = cx
+            .background_executor()
+            .spawn(async move { review::fetch(&fetch_repo) });
+        cx.spawn(async move |view, cx| {
+            let fetched = fetch.await;
+            let proceed = view
+                .update(cx, |this, cx| {
+                    if this.epoch != epoch {
+                        return false;
+                    }
+                    if let Err(error) = &fetched {
+                        this.fail_review(format!("Fetch error: {error:#}"), cx);
+                        return false;
+                    }
+                    this.review_step = Some("Loading latest MR diff…");
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !proceed {
+                return;
+            }
+            let result = cx
+                .background_executor()
+                .spawn(async move { Review::load(&repo, &branch) })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.epoch != epoch {
+                    return;
+                }
+                match result {
+                    Ok(review) => {
+                        this.review_step = None;
+                        this.snapshot = review.snapshot();
+                        this.notice = format!(
+                            "{} changed file{} in {}",
+                            review.files.len(),
+                            if review.files.len() == 1 { "" } else { "s" },
+                            review.branch
+                        );
+                        this.review = Some(Arc::new(review));
+                        this.rebuild_tree(false, cx);
+                    }
+                    Err(error) => this.fail_review(format!("Review init error: {error:#}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn fail_review(&mut self, message: String, cx: &mut Context<Self>) {
+        self.review_step = None;
+        self.review_error = Some(message.clone());
+        self.show_error(message, cx);
+    }
+
+    fn exit_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review_branch.is_none() {
+            return;
+        }
+        if let Some(root) = self.repo.as_ref().map(|repo| repo.root.clone()) {
+            self.open(root, window, cx);
+        }
+    }
+
+    fn open_branch_picker(
+        &mut self,
+        _: &ReviewBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if self.busy || self.opening {
+            return;
+        }
+        self.picker_open = true;
+        self.picker_note = None;
+        self.branch_query.clear();
+        self.branch_cursor = 0;
+        self.branch_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        self.picker_request += 1;
+        let request = self.picker_request;
+        self.branches_loading = true;
+        // Known refs appear at once; a fetch then adds new remote branches.
+        cx.spawn(async move |view, cx| {
+            for fetch in [false, true] {
+                let repo = repo.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let fetched = if fetch {
+                            review::fetch(&repo).map_err(|error| format!("{error:#}"))
+                        } else {
+                            Ok(())
+                        };
+                        (fetched, review::branches(&repo))
+                    })
+                    .await;
+                let open = view
+                    .update(cx, |this, cx| {
+                        if request != this.picker_request || !this.picker_open {
+                            return false;
+                        }
+                        let (fetched, branches) = result;
+                        if let Err(error) = fetched {
+                            this.picker_note = Some(format!("Fetch failed: {error}"));
+                        }
+                        match branches {
+                            Ok(branches) => this.set_branches(branches),
+                            Err(error) => this.picker_note = Some(format!("{error:#}")),
+                        }
+                        if fetch {
+                            this.branches_loading = false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !open {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Replaces the list and keeps the highlighted branch highlighted.
+    fn set_branches(&mut self, branches: Vec<Branch>) {
+        let highlighted = match self.picker_rows().get(self.branch_cursor) {
+            Some(PickerRow::Branch(index)) => self.branches.get(*index).cloned(),
+            _ => None,
+        };
+        self.branches = branches;
+        if let Some(branch) = highlighted {
+            let rows = self.picker_rows();
+            self.branch_cursor = rows
+                .iter()
+                .position(|row| matches!(row, PickerRow::Branch(i) if self.branches[*i] == branch))
+                .unwrap_or(0);
+        }
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.picker_open {
+            return;
+        }
+        self.picker_open = false;
+        self.picker_request += 1;
+        self.branches_loading = false;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    /// Branches matching the query, then the typed name when no branch has it exactly.
+    fn picker_rows(&self) -> Vec<PickerRow> {
+        let query = self.branch_query.to_lowercase();
+        let mut rows: Vec<_> = self
+            .branches
+            .iter()
+            .enumerate()
+            .filter(|(_, branch)| branch.name.to_lowercase().contains(&query))
+            .map(|(index, _)| PickerRow::Branch(index))
+            .collect();
+        if !self.branch_query.is_empty()
+            && !self
+                .branches
+                .iter()
+                .any(|branch| branch.name == self.branch_query)
+        {
+            rows.push(PickerRow::Typed);
+        }
+        rows
+    }
+
+    fn move_picker(&mut self, offset: isize, cx: &mut Context<Self>) {
+        let count = self.picker_rows().len();
+        if count == 0 {
+            return;
+        }
+        self.branch_cursor = self
+            .branch_cursor
+            .saturating_add_signed(offset)
+            .min(count - 1);
+        self.branch_scroll
+            .scroll_to_item(self.branch_cursor, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn confirm_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.picker_open {
+            return;
+        }
+        let rows = self.picker_rows();
+        let branch = match rows.get(self.branch_cursor.min(rows.len().saturating_sub(1))) {
+            Some(PickerRow::Branch(index)) => self.branches[*index].name.clone(),
+            Some(PickerRow::Typed) => self.branch_query.clone(),
+            None => return,
+        };
+        self.start_review(branch, window, cx);
     }
 
     fn show_error(&mut self, error: impl std::fmt::Display, cx: &mut Context<Self>) {
@@ -1221,12 +1564,47 @@ impl Give {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
                     .when(self.repo.is_some(), |el| {
                         el.child(div().text_color(rgb(BORDER)).child("/"))
-                            .child(ui_icon("branch", 13., MUTED))
+                            .when(self.review_branch.is_some(), |el| {
+                                el.child(
+                                    div()
+                                        .px_1p5()
+                                        .rounded(px(3.))
+                                        .bg(rgb(0x2b4057))
+                                        .text_size(px(10.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(ACCENT))
+                                        .child("REVIEW"),
+                                )
+                            })
+                            .child(ui_icon(
+                                "branch",
+                                13.,
+                                if self.review_branch.is_some() {
+                                    ACCENT
+                                } else {
+                                    MUTED
+                                },
+                            ))
                             .child(
                                 div()
-                                    .text_color(rgb(MUTED))
-                                    .child(self.snapshot.branch.clone()),
+                                    .text_color(rgb(if self.review_branch.is_some() {
+                                        TEXT
+                                    } else {
+                                        MUTED
+                                    }))
+                                    .child(
+                                        self.review_branch
+                                            .clone()
+                                            .unwrap_or_else(|| self.snapshot.branch.clone()),
+                                    ),
                             )
+                            .when_some(self.review.as_ref(), |el, review| {
+                                el.child(
+                                    div()
+                                        .text_color(rgb(MUTED))
+                                        .child(format!("vs {}", review.compared_to())),
+                                )
+                            })
                     }),
             )
             .child(
@@ -1264,13 +1642,39 @@ impl Give {
                                 if self.terminal_visible { ACCENT } else { MUTED },
                             )),
                     )
+                    .when(self.review_branch.is_some(), |el| {
+                        el.child(
+                            Button::new("exit-review")
+                                .ghost()
+                                .xsmall()
+                                .label("Exit review")
+                                .disabled(self.busy || self.opening)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.exit_review(window, cx)),
+                                ),
+                        )
+                    })
+                    .child(
+                        Button::new("review-branch")
+                            .ghost()
+                            .xsmall()
+                            .icon(gpui_component::Icon::empty().path("icons/branch.svg"))
+                            .label("Review branch")
+                            .tooltip("Review a branch against main · ⌘⇧R")
+                            .disabled(self.repo.is_none() || self.busy || self.opening)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_branch_picker(&ReviewBranch, window, cx)
+                            })),
+                    )
                     .child(
                         Button::new("refresh")
                             .ghost()
                             .xsmall()
                             .label("Refresh")
                             .disabled(self.repo.is_none() || self.busy || self.opening)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.manual_refresh(window, cx)),
+                            ),
                     )
                     .child(
                         Button::new("open")
@@ -1298,6 +1702,7 @@ impl Give {
             .iter()
             .filter(|file| file.unstaged())
             .count();
+        let reviewing = self.review_branch.is_some();
         let can_commit = staged > 0
             && !self.busy
             && !self.opening
@@ -1325,23 +1730,27 @@ impl Give {
                             .gap_2()
                             .text_size(px(11.))
                             .text_color(rgb(MUTED))
-                            .child("CHANGES")
+                            .child(if reviewing { "BRANCH" } else { "CHANGES" })
                             .child(
                                 div()
                                     .text_color(rgb(ACCENT))
                                     .child(self.snapshot.files.len().to_string()),
                             ),
                     )
-                    .child(
-                        Button::new("all")
-                            .ghost()
-                            .xsmall()
-                            .label("Stage all")
-                            .disabled(self.busy || self.opening || working == 0)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.mutate(true, window, cx)),
-                            ),
-                    ),
+                    .when(!reviewing, |el| {
+                        el.child(
+                            Button::new("all")
+                                .ghost()
+                                .xsmall()
+                                .label("Stage all")
+                                .disabled(self.busy || self.opening || working == 0)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.mutate(true, window, cx)
+                                    }),
+                                ),
+                        )
+                    }),
             )
             .child(
                 div().px_2().pb_2().child(
@@ -1400,7 +1809,9 @@ impl Give {
                                                         }
                                                         _ => MUTED,
                                                     };
-                                                    let badge = if file.untracked() {
+                                                    let badge = if this.review_branch.is_some() {
+                                                        file.index.to_string()
+                                                    } else if file.untracked() {
                                                         "U".into()
                                                     } else if file.index == 'D'
                                                         || file.worktree == 'D'
@@ -1414,6 +1825,11 @@ impl Give {
                                                     (icon, color, badge)
                                                 }
                                                 _ => ("file", MUTED, String::new()),
+                                            };
+                                            let name_color = match &row.kind {
+                                                RowKind::File(file) => file_name_color(file),
+                                                _ if navigable => TEXT,
+                                                _ => MUTED,
                                             };
                                             div()
                                                 .id(index)
@@ -1493,12 +1909,16 @@ impl Give {
                                                             } else {
                                                                 10.
                                                             }))
-                                                            .text_color(rgb(if navigable {
-                                                                TEXT
-                                                            } else {
-                                                                MUTED
-                                                            }))
-                                                            .child(row.label.clone()),
+                                                            .text_color(rgb(name_color))
+                                                            .child(
+                                                                if this.review_branch.is_some()
+                                                                    && row.kind == RowKind::Section
+                                                                {
+                                                                    "BRANCH CHANGES".into()
+                                                                } else {
+                                                                    row.label.clone()
+                                                                },
+                                                            ),
                                                     )
                                                     .when(!badge.is_empty(), |el| {
                                                         el.child(
@@ -1523,50 +1943,98 @@ impl Give {
                         )
                     })
                     .when(self.tree.is_empty(), |el| {
-                        el.child(div().p_4().text_color(rgb(MUTED)).child("No changed files"))
-                    }),
-            )
-            .child(
-                div()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .p_2()
-                    .child(
-                        Button::new("commit-toggle")
-                            .ghost()
-                            .small()
-                            .w_full()
-                            .label(format!("Commit · {staged} staged"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.commit_open = !this.commit_open;
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.commit_open, |el| {
                         el.child(
                             div()
-                                .pt_2()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(Input::new(&self.commit_input).small().disabled(self.busy))
-                                .child(
-                                    Button::new("commit")
-                                        .primary()
-                                        .small()
-                                        .label(if self.busy {
-                                            "Working…"
-                                        } else {
-                                            "Commit staged changes"
-                                        })
-                                        .disabled(!can_commit)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.commit(&Commit, window, cx)
-                                        })),
-                                ),
+                                .p_4()
+                                .text_color(rgb(if self.review_error.is_some() {
+                                    RED
+                                } else {
+                                    MUTED
+                                }))
+                                .child(if let Some(step) = self.review_step {
+                                    step.to_owned()
+                                } else if let Some(error) = &self.review_error {
+                                    error.clone()
+                                } else if reviewing {
+                                    "No changes in this branch".to_owned()
+                                } else {
+                                    "No changed files".to_owned()
+                                }),
                         )
                     }),
             )
+            .when(reviewing, |el| {
+                el.child(
+                    div()
+                        .border_t_1()
+                        .border_color(rgb(BORDER))
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(
+                            div()
+                                .text_color(rgb(TEXT))
+                                .child(if self.review_step.is_some() {
+                                    "Loading review…".to_owned()
+                                } else {
+                                    self.review
+                                        .as_ref()
+                                        .map(|review| review.status())
+                                        .unwrap_or_default()
+                                }),
+                        )
+                        .child("Read-only review · Exit review returns to local changes"),
+                )
+            })
+            .when(!reviewing, |el| {
+                el.child(
+                    div()
+                        .border_t_1()
+                        .border_color(rgb(BORDER))
+                        .p_2()
+                        .child(
+                            Button::new("commit-toggle")
+                                .ghost()
+                                .small()
+                                .w_full()
+                                .label(format!("Commit · {staged} staged"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.commit_open = !this.commit_open;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(self.commit_open, |el| {
+                            el.child(
+                                div()
+                                    .pt_2()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        Input::new(&self.commit_input).small().disabled(self.busy),
+                                    )
+                                    .child(
+                                        Button::new("commit")
+                                            .primary()
+                                            .small()
+                                            .label(if self.busy {
+                                                "Working…"
+                                            } else {
+                                                "Commit staged changes"
+                                            })
+                                            .disabled(!can_commit)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.commit(&Commit, window, cx)
+                                            })),
+                                    ),
+                            )
+                        }),
+                )
+            })
     }
 
     fn preview_bottom_padding(&self) -> usize {
@@ -1830,25 +2298,40 @@ impl Give {
                                             cx.listener(|this, _, _, cx| this.next_change(cx)),
                                         ),
                                 )
-                                .child(
-                                    Button::new("stage-file")
-                                        .ghost()
-                                        .xsmall()
-                                        .label(if unstage { "Unstage" } else { "Stage" })
-                                        .disabled(self.busy || self.opening)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.mutate(false, window, cx)
-                                        })),
-                                ),
+                                .when(self.review_branch.is_none(), |el| {
+                                    el.child(
+                                        Button::new("stage-file")
+                                            .ghost()
+                                            .xsmall()
+                                            .label(if unstage { "Unstage" } else { "Stage" })
+                                            .disabled(self.busy || self.opening)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.mutate(false, window, cx)
+                                            })),
+                                    )
+                                }),
                         )
                     }),
             )
             .when(!self.preview_loading && self.selected.is_none(), |el| {
-                el.child(empty_state(
-                    "Select a changed file",
-                    "Browse the tree to review the full file and its changes.",
-                    false,
-                ))
+                let branch = self.review_branch.clone().unwrap_or_default();
+                el.child(if let Some(step) = self.review_step {
+                    empty_state(format!("Reviewing {branch}"), step, false)
+                } else if let Some(error) = &self.review_error {
+                    empty_state(format!("Could not review {branch}"), error.clone(), false)
+                } else if self.review.as_ref().is_some_and(|r| r.files.is_empty()) {
+                    empty_state(
+                        format!("{branch} has no changes"),
+                        "The branch matches its base.",
+                        false,
+                    )
+                } else {
+                    empty_state(
+                        "Select a changed file",
+                        "Browse the tree to review the full file and its changes.",
+                        false,
+                    )
+                })
             })
             .when(self.selected.is_some(), |el| {
                 el.when_some(self.diff.notice.clone(), |el, notice| {
@@ -1961,21 +2444,25 @@ impl Give {
                                                         )
                                                     }),
                                                 )
-                                                .when(this.show_deletions, |el| {
-                                                    el.child(
-                                                        div()
-                                                            .w(px(54.))
-                                                            .flex_shrink_0()
-                                                            .pr_2()
-                                                            .text_right()
-                                                            .text_color(rgb(MUTED))
-                                                            .child(
-                                                                line.old
-                                                                    .map(|n| n.to_string())
-                                                                    .unwrap_or_default(),
-                                                            ),
-                                                    )
-                                                })
+                                                .when(
+                                                    this.show_deletions
+                                                        || this.review_branch.is_some(),
+                                                    |el| {
+                                                        el.child(
+                                                            div()
+                                                                .w(px(54.))
+                                                                .flex_shrink_0()
+                                                                .pr_2()
+                                                                .text_right()
+                                                                .text_color(rgb(MUTED))
+                                                                .child(
+                                                                    line.old
+                                                                        .map(|n| n.to_string())
+                                                                        .unwrap_or_default(),
+                                                                ),
+                                                        )
+                                                    },
+                                                )
                                                 .child(
                                                     div()
                                                         .w(px(62.))
@@ -2020,6 +2507,7 @@ impl Give {
                             .with_horizontal_sizing_behavior(
                                 ListHorizontalSizingBehavior::Unconstrained,
                             )
+                            .with_width_from_item(Some(self.widest_line))
                             .track_scroll(self.diff_scroll.clone())
                             .flex_1()
                             .min_w_0()
@@ -2079,6 +2567,200 @@ impl Give {
             bounds,
             window,
         );
+    }
+
+    fn branch_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.picker_rows();
+        let height = (rows.len().clamp(1, 11) as f32) * 30.;
+        div()
+            .id("branch-picker-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .pt(px(88.))
+            .bg(hsla(0., 0., 0., 0.35))
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_picker(window, cx)),
+            )
+            .child(
+                div()
+                    .key_context("BranchPicker")
+                    .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.move_picker(-1, cx)))
+                    .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.move_picker(1, cx)))
+                    .on_action(cx.listener(|this, _: &PickerCancel, window, cx| {
+                        this.close_picker(window, cx)
+                    }))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .w(px(560.))
+                    .h_auto()
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(0x35495f))
+                    .rounded(px(8.))
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px_4()
+                            .pt_3()
+                            .pb_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Review branch"),
+                            )
+                            .child(
+                                div().text_size(px(11.)).text_color(rgb(MUTED)).child(
+                                    "Fetches all remotes, then compares with the open GitLab MR or the merge-base with main.",
+                                ),
+                            ),
+                    )
+                    .child(
+                        div().px_3().pb_2().child(
+                            Input::new(&self.branch_input)
+                                .small()
+                                .prefix(ui_icon("branch", 13., MUTED)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .border_t_1()
+                            .border_color(rgb(BORDER))
+                            .h(px(height))
+                            .when(rows.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .h_full()
+                                        .px_4()
+                                        .flex()
+                                        .items_center()
+                                        .text_color(rgb(MUTED))
+                                        .child(if self.branches_loading {
+                                            "Loading branches…"
+                                        } else {
+                                            "No branches"
+                                        }),
+                                )
+                            })
+                            .when(!rows.is_empty(), |el| {
+                                el.child(
+                                    uniform_list(
+                                        "branches",
+                                        rows.len(),
+                                        cx.processor(
+                                            |this, range: std::ops::Range<usize>, _, cx| {
+                                                let rows = this.picker_rows();
+                                                range
+                                                    .filter_map(|index| {
+                                                        let row = *rows.get(index)?;
+                                                        Some(this.picker_row(index, row, cx))
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            },
+                                        ),
+                                    )
+                                    .track_scroll(self.branch_scroll.clone())
+                                    .h_full(),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .h(px(28.))
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .border_t_1()
+                            .border_color(rgb(BORDER))
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .when(self.picker_note.is_some(), |el| {
+                                        el.text_color(rgb(RED))
+                                    })
+                                    .child(if let Some(note) = &self.picker_note {
+                                        note.clone()
+                                    } else if self.branches_loading {
+                                        "Fetching remotes…".to_owned()
+                                    } else {
+                                        format!("{} branches", self.branches.len())
+                                    }),
+                            )
+                            .child("↑↓ choose · Enter review · Esc close"),
+                    ),
+            )
+    }
+
+    fn picker_row(&self, index: usize, row: PickerRow, cx: &mut Context<Self>) -> Stateful<Div> {
+        let selected = index == self.branch_cursor;
+        let (name, tag, current) = match row {
+            PickerRow::Branch(i) => {
+                let branch = &self.branches[i];
+                (
+                    branch.name.clone(),
+                    if branch.remote.is_some() {
+                        "remote"
+                    } else {
+                        "local"
+                    },
+                    branch.current,
+                )
+            }
+            PickerRow::Typed => (format!("Review “{}”", self.branch_query), "", false),
+        };
+        div()
+            .id(index)
+            .h(px(30.))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .bg(rgb(if selected { 0x2b4057 } else { PANEL }))
+            .hover(|el| el.bg(rgb(SURFACE)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.branch_cursor = index;
+                this.confirm_branch(window, cx);
+            }))
+            .child(ui_icon(
+                "branch",
+                13.,
+                if tag == "remote" { MUTED } else { ACCENT },
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.))
+                    .child(name),
+            )
+            .when(current, |el| {
+                el.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(GREEN))
+                        .child("current"),
+                )
+            })
+            .when(!tag.is_empty(), |el| {
+                el.child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(tag))
+            })
     }
 
     fn welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2157,7 +2839,13 @@ impl Render for Give {
                 }),
             )
             .on_action(cx.listener(Self::toggle_terminal))
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            .on_action(
+                cx.listener(|this, _: &Refresh, window, cx| this.manual_refresh(window, cx)),
+            )
+            .on_action(cx.listener(Self::open_branch_picker))
+            .on_action(
+                cx.listener(|this, _: &ExitReview, window, cx| this.exit_review(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &NextFile, window, cx| this.navigate(1, window, cx)))
             .on_action(
                 cx.listener(|this, _: &PreviousFile, window, cx| this.navigate(-1, window, cx)),
@@ -2186,6 +2874,7 @@ impl Render for Give {
             .on_action(
                 cx.listener(|this, _: &LastRow, window, cx| this.navigate(isize::MAX, window, cx)),
             )
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -2228,8 +2917,36 @@ impl Render for Give {
                             .text_color(rgb(if self.error { RED } else { MUTED }))
                             .child(self.notice.clone()),
                     )
-                    .child("Tab focus · ↑↓ / J K move · D deletions · Space / Ctrl+N next change"),
+                    .child(
+                        "Tab focus · ↑↓ / J K move · D deletions · Space / Ctrl+N next change · ⌘⇧R review branch",
+                    ),
             )
+            .when(self.picker_open, |el| el.child(self.branch_picker(cx)))
+    }
+}
+
+fn load_slot(
+    slot: &Slot,
+    repo: &Repository,
+    file: &ChangedFile,
+    review: Option<&Review>,
+) -> Result<give::preview_cache::Pair, String> {
+    match review {
+        Some(review) => slot.load_with(|| review.preview_pair(repo, file)),
+        None => slot.load(repo, file),
+    }
+}
+
+/// Untracked (not yet added to Git) is red, deleted grey, newly added green, otherwise modified blue.
+fn file_name_color(file: &ChangedFile) -> u32 {
+    if file.untracked() || file.conflicted() {
+        NAME_UNTRACKED
+    } else if file.index == 'D' || file.worktree == 'D' {
+        NAME_DELETED
+    } else if file.index == 'A' {
+        NAME_ADDED
+    } else {
+        NAME_MODIFIED
     }
 }
 
@@ -2241,7 +2958,7 @@ fn brand_icon(side: f32) -> impl IntoElement {
     .object_fit(ObjectFit::Contain)
 }
 
-fn empty_state(title: &'static str, detail: &'static str, icon: bool) -> impl IntoElement {
+fn empty_state(title: impl Into<SharedString>, detail: impl Into<SharedString>, icon: bool) -> Div {
     div()
         .flex_1()
         .flex()
@@ -2250,12 +2967,19 @@ fn empty_state(title: &'static str, detail: &'static str, icon: bool) -> impl In
         .justify_center()
         .gap_3()
         .when(icon, |el| el.child(brand_icon(72.)))
-        .child(div().text_size(px(18.)).text_color(rgb(TEXT)).child(title))
         .child(
             div()
+                .text_size(px(18.))
+                .text_color(rgb(TEXT))
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .max_w(px(560.))
+                .text_center()
                 .text_size(px(12.))
                 .text_color(rgb(MUTED))
-                .child(detail),
+                .child(detail.into()),
         )
 }
 

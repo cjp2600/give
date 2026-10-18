@@ -1,6 +1,6 @@
 ARGS ?=
 
-.PHONY: run build test check fmt icons app clean
+.PHONY: run build test check fmt icons app install clean
 
 ifeq ($(shell uname -s),Darwin)
 run:
@@ -29,6 +29,12 @@ icons:
 
 app:
 	./scripts/bundle-macos.sh
+
+# Optimized release bundle, replacing /Applications/give.app (quit a running copy first).
+install: app
+	rm -rf /Applications/give.app
+	ditto dist/give.app /Applications/give.app
+	@echo 'Installed /Applications/give.app'
 
 clean:
 	cargo clean
