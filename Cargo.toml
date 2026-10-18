@@ -1,0 +1,23 @@
+[package]
+name = "give"
+version = "0.1.0"
+edition = "2024"
+description = "A native GPUI desktop companion to giv"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+gpui-component = "=0.5.1"
+wait-timeout = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+lto = "thin"
+strip = true
+
