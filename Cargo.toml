@@ -2,17 +2,27 @@
 name = "give"
 version = "0.1.0"
 edition = "2024"
-description = "A native GPUI desktop companion to giv"
+description = "A native GPUI desktop version of giv"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
+alacritty_terminal = "=0.25.1"
+portable-pty = "=0.9.0"
+tempfile = "3"
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 gpui-component = "=0.5.1"
 wait-timeout = "0.2"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
-tempfile = "3"
+serde_json = "1"
 
 [profile.dev]
 debug = 1

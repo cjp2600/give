@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fs,
+    hash::{Hash, Hasher},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -57,6 +59,7 @@ impl ChangedFile {
 pub struct Snapshot {
     pub branch: String,
     pub files: Vec<ChangedFile>,
+    pub versions: HashMap<PathBuf, u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +77,7 @@ pub enum LineKind {
     Removed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLine {
     pub old: Option<usize>,
     pub new: Option<usize>,
@@ -82,7 +85,7 @@ pub struct DiffLine {
     pub kind: LineKind,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Diff {
     pub lines: Vec<DiffLine>,
     pub raw: String,
@@ -130,9 +133,29 @@ impl Repository {
                 format!("detached · {}", String::from_utf8_lossy(&bytes).trim_end())
             }
         };
+        let files = parse_status(&raw)?;
+        let head =
+            run(&self.root, ["rev-parse", "--verify", "HEAD"], None, false).unwrap_or_default();
+        // A porcelain status can stay " M" while the file changes repeatedly.
+        // Per-file versions invalidate only that file, also when HEAD changes.
+        let versions = files
+            .iter()
+            .map(|file| {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                head.hash(&mut hash);
+                file.index.hash(&mut hash);
+                file.worktree.hash(&mut hash);
+                if let Ok(metadata) = fs::metadata(self.root.join(&file.path)) {
+                    metadata.len().hash(&mut hash);
+                    metadata.modified().ok().hash(&mut hash);
+                }
+                (file.path.clone(), hash.finish())
+            })
+            .collect();
         Ok(Snapshot {
             branch,
-            files: parse_status(&raw)?,
+            files,
+            versions,
         })
     }
 
@@ -215,6 +238,93 @@ impl Repository {
             result.notice = Some("New empty file. Ready to stage.".into());
         }
         Ok(result)
+    }
+
+    /// Live giv preview: all uncommitted changes vs HEAD, over the full file.
+    /// Keep `diff` separate for callers that explicitly need index/worktree patches.
+    pub fn preview(&self, file: &ChangedFile, show_deletions: bool) -> Result<Diff> {
+        let (normal, deletions) = self.preview_pair(file)?;
+        Ok(if show_deletions { deletions } else { normal })
+    }
+
+    /// Both modes share one Git subprocess result and one full-file read.
+    pub fn preview_pair(&self, file: &ChangedFile) -> Result<(Diff, Diff)> {
+        use crate::preview;
+        let mut diff = Diff::default();
+        let new_file = file.untracked() || file.index == 'A';
+        if !new_file {
+            let has_head = run(&self.root, ["rev-parse", "--verify", "HEAD"], None, false).is_ok();
+            let mut args: Vec<OsString> =
+                ["diff", "-w", "--no-ext-diff", "--no-textconv", "--no-color"]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+            if preview::known_text(&file.path) {
+                args.push("--text".into());
+            }
+            if has_head {
+                args.push("HEAD".into());
+            } else if file.staged() {
+                args.push("--cached".into());
+            }
+            args.push("--".into());
+            args.push(file.path.as_os_str().into());
+            // The path selected by giv is the destination of a rename.
+            let raw = run(&self.root, args, None, false)?;
+            diff = parse_diff(&String::from_utf8_lossy(&raw));
+        }
+        if !preview::known_text(&file.path)
+            && (preview::binary_path(&file.path) || preview::binary_notice(&diff.raw))
+        {
+            diff.lines.clear();
+            diff.notice = Some("Binary file — content not shown.".into());
+            return Ok((diff.clone(), diff));
+        }
+        let full = self.root.join(&file.path);
+        let body = (|| -> Result<Vec<u8>> {
+            if !fs::metadata(&full)?.is_file() {
+                bail!("Preview is unavailable for this file type.");
+            }
+            Ok(fs::read(&full)?)
+        })();
+        let build = |show_deletions| {
+            let mut result = diff.clone();
+            match &body {
+                Err(error) => {
+                    result.lines = preview::fallback(&diff, show_deletions);
+                    result.notice = Some(format!("{error:#}"));
+                }
+                Ok(body) => {
+                    if !preview::known_text(&file.path) && preview::binary_content(body) {
+                        result.lines.clear();
+                        result.notice = Some("Binary file — content not shown.".into());
+                        return result;
+                    }
+                    if new_file || diff.raw.trim().is_empty() {
+                        result.lines = preview::full_context(body);
+                        result.notice = Some(
+                            if file.untracked() {
+                                "Untracked file — showing full content"
+                            } else if new_file {
+                                "New file — showing full content"
+                            } else {
+                                "No uncommitted changes vs HEAD — showing file from disk"
+                            }
+                            .into(),
+                        );
+                    } else {
+                        result.lines = preview::overlay(body, &diff.raw, show_deletions)
+                            .unwrap_or_else(|| preview::fallback(&diff, show_deletions));
+                        result.notice = None;
+                    }
+                    if result.lines.len() >= preview::MAX_LINES {
+                        result.notice = Some("Preview limited to 6,000 lines.".into());
+                    }
+                }
+            }
+            result
+        };
+        Ok((build(false), build(true)))
     }
 
     pub fn stage(&self, file: Option<&ChangedFile>) -> Result<()> {
@@ -363,7 +473,7 @@ pub fn parse_diff(raw: &str) -> Diff {
         diff.lines.push(DiffLine {
             old: old_number,
             new: new_number,
-            text: text.replace('\t', "    "),
+            text: text.to_owned(),
             kind,
         });
     }

@@ -1,0 +1,735 @@
+[
+  {
+    "name": "replacement",
+    "body": "before\nfirst\nadded\nthird\nafter\n",
+    "patch": "@@ -2,2 +2,3 @@\n first\n-old\n+added\n+third\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "before",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "first",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 3,
+        "text": "added",
+        "kind": "Added"
+      },
+      {
+        "old": null,
+        "new": 4,
+        "text": "third",
+        "kind": "Added"
+      },
+      {
+        "old": 5,
+        "new": 5,
+        "text": "after",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "replacement",
+    "body": "before\nfirst\nadded\nthird\nafter\n",
+    "patch": "@@ -2,2 +2,3 @@\n first\n-old\n+added\n+third\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "before",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "first",
+        "kind": "Context"
+      },
+      {
+        "old": 3,
+        "new": null,
+        "text": "old",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 3,
+        "text": "added",
+        "kind": "Added"
+      },
+      {
+        "old": null,
+        "new": 4,
+        "text": "third",
+        "kind": "Added"
+      },
+      {
+        "old": 5,
+        "new": 5,
+        "text": "after",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "distant hunks",
+    "body": "one\nnew two\nthree\nfour\nfive\nnew six\nlast\n",
+    "patch": "@@ -6 +6 @@\n-six\n+new six\n@@ -2 +2 @@\n-two\n+new two\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new two",
+        "kind": "Added"
+      },
+      {
+        "old": 3,
+        "new": 3,
+        "text": "three",
+        "kind": "Context"
+      },
+      {
+        "old": 4,
+        "new": 4,
+        "text": "four",
+        "kind": "Context"
+      },
+      {
+        "old": 5,
+        "new": 5,
+        "text": "five",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 6,
+        "text": "new six",
+        "kind": "Added"
+      },
+      {
+        "old": 7,
+        "new": 7,
+        "text": "last",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "distant hunks",
+    "body": "one\nnew two\nthree\nfour\nfive\nnew six\nlast\n",
+    "patch": "@@ -6 +6 @@\n-six\n+new six\n@@ -2 +2 @@\n-two\n+new two\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": null,
+        "text": "two",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new two",
+        "kind": "Added"
+      },
+      {
+        "old": 3,
+        "new": 3,
+        "text": "three",
+        "kind": "Context"
+      },
+      {
+        "old": 4,
+        "new": 4,
+        "text": "four",
+        "kind": "Context"
+      },
+      {
+        "old": 5,
+        "new": 5,
+        "text": "five",
+        "kind": "Context"
+      },
+      {
+        "old": 6,
+        "new": null,
+        "text": "six",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 6,
+        "text": "new six",
+        "kind": "Added"
+      },
+      {
+        "old": 7,
+        "new": 7,
+        "text": "last",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "delete first",
+    "body": "two\nthree\n",
+    "patch": "@@ -1,3 +1,2 @@\n-one\n two\n three\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "two",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "three",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "delete first",
+    "body": "two\nthree\n",
+    "patch": "@@ -1,3 +1,2 @@\n-one\n two\n three\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": null,
+        "text": "one",
+        "kind": "Removed"
+      },
+      {
+        "old": 1,
+        "new": 1,
+        "text": "two",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "three",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "delete last",
+    "body": "one\ntwo\n",
+    "patch": "@@ -1,3 +1,2 @@\n one\n two\n-three\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "two",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "delete last",
+    "body": "one\ntwo\n",
+    "patch": "@@ -1,3 +1,2 @@\n one\n two\n-three\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "two",
+        "kind": "Context"
+      },
+      {
+        "old": 3,
+        "new": null,
+        "text": "three",
+        "kind": "Removed"
+      }
+    ]
+  },
+  {
+    "name": "delete all",
+    "body": "",
+    "patch": "@@ -1,2 +0,0 @@\n-one\n-two\n",
+    "show": false,
+    "ok": true,
+    "rows": []
+  },
+  {
+    "name": "delete all",
+    "body": "",
+    "patch": "@@ -1,2 +0,0 @@\n-one\n-two\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": null,
+        "text": "one",
+        "kind": "Removed"
+      },
+      {
+        "old": 2,
+        "new": null,
+        "text": "two",
+        "kind": "Removed"
+      }
+    ]
+  },
+  {
+    "name": "insert first",
+    "body": "new\none\ntwo\n",
+    "patch": "@@ -1,2 +1,3 @@\n+new\n one\n two\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": null,
+        "new": 1,
+        "text": "new",
+        "kind": "Added"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": 3,
+        "new": 3,
+        "text": "two",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "insert first",
+    "body": "new\none\ntwo\n",
+    "patch": "@@ -1,2 +1,3 @@\n+new\n one\n two\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": null,
+        "new": 1,
+        "text": "new",
+        "kind": "Added"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": 3,
+        "new": 3,
+        "text": "two",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "insert last",
+    "body": "one\ntwo\nnew\n",
+    "patch": "@@ -1,2 +1,3 @@\n one\n two\n+new\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "two",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 3,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "insert last",
+    "body": "one\ntwo\nnew\n",
+    "patch": "@@ -1,2 +1,3 @@\n one\n two\n+new\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "one",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": 2,
+        "text": "two",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 3,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "no newline",
+    "body": "new",
+    "patch": "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": null,
+        "new": 1,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "no newline",
+    "body": "new",
+    "patch": "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": null,
+        "text": "old",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 1,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "tabs crlf",
+    "body": "a\tb\r\nnew\r\n",
+    "patch": "@@ -1,2 +1,2 @@\r\n a\tb\r\n-old\r\n+new\r\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "a       b",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "tabs crlf",
+    "body": "a\tb\r\nnew\r\n",
+    "patch": "@@ -1,2 +1,2 @@\r\n a\tb\r\n-old\r\n+new\r\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "a       b",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": null,
+        "text": "old",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "current indentation",
+    "body": "    current\nnew\n",
+    "patch": "@@ -1,2 +1,2 @@\n current\n-old\n+new\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "    current",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "current indentation",
+    "body": "    current\nnew\n",
+    "patch": "@@ -1,2 +1,2 @@\n current\n-old\n+new\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "    current",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": null,
+        "text": "old",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "blank lines",
+    "body": "\nnew\n\n",
+    "patch": "@@ -1,3 +1,3 @@\n \n-old\n+new\n \n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "",
+        "kind": "Context"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new",
+        "kind": "Added"
+      },
+      {
+        "old": 3,
+        "new": 3,
+        "text": "",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "blank lines",
+    "body": "\nnew\n\n",
+    "patch": "@@ -1,3 +1,3 @@\n \n-old\n+new\n \n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": 1,
+        "text": "",
+        "kind": "Context"
+      },
+      {
+        "old": 2,
+        "new": null,
+        "text": "old",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "new",
+        "kind": "Added"
+      },
+      {
+        "old": 3,
+        "new": 3,
+        "text": "",
+        "kind": "Context"
+      }
+    ]
+  },
+  {
+    "name": "header looking code",
+    "body": "++ actual code\n",
+    "patch": "--- a/code\n+++ b/code\n@@ -1 +1 @@\n--- old code\n+++ actual code\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": null,
+        "new": 1,
+        "text": "++ actual code",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "header looking code",
+    "body": "++ actual code\n",
+    "patch": "--- a/code\n+++ b/code\n@@ -1 +1 @@\n--- old code\n+++ actual code\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": 1,
+        "new": null,
+        "text": "-- old code",
+        "kind": "Removed"
+      },
+      {
+        "old": null,
+        "new": 1,
+        "text": "++ actual code",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "new file",
+    "body": "one\ntwo\n",
+    "patch": "@@ -0,0 +1,2 @@\n+one\n+two\n",
+    "show": false,
+    "ok": true,
+    "rows": [
+      {
+        "old": null,
+        "new": 1,
+        "text": "one",
+        "kind": "Added"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "two",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "new file",
+    "body": "one\ntwo\n",
+    "patch": "@@ -0,0 +1,2 @@\n+one\n+two\n",
+    "show": true,
+    "ok": true,
+    "rows": [
+      {
+        "old": null,
+        "new": 1,
+        "text": "one",
+        "kind": "Added"
+      },
+      {
+        "old": null,
+        "new": 2,
+        "text": "two",
+        "kind": "Added"
+      }
+    ]
+  },
+  {
+    "name": "missing hunk",
+    "body": "one\n",
+    "patch": "not a diff",
+    "show": false,
+    "ok": false,
+    "rows": []
+  },
+  {
+    "name": "missing hunk",
+    "body": "one\n",
+    "patch": "not a diff",
+    "show": true,
+    "ok": false,
+    "rows": []
+  },
+  {
+    "name": "out of bounds",
+    "body": "one\n",
+    "patch": "@@ -20 +20 @@\n-old\n+new\n",
+    "show": false,
+    "ok": false,
+    "rows": []
+  },
+  {
+    "name": "out of bounds",
+    "body": "one\n",
+    "patch": "@@ -20 +20 @@\n-old\n+new\n",
+    "show": true,
+    "ok": false,
+    "rows": []
+  }
+]
