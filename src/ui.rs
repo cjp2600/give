@@ -1,13 +1,15 @@
 use crate::{
-    ActivateRow, CollapseRow, Commit, CopyDiff, CopySelection, ExitReview, ExpandRow, FirstRow,
-    LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerCancel, PickerDown,
-    PickerUp, PreviousFile, Refresh, ReviewBranch, SelectAllText, SelectDown, SelectLeft,
-    SelectRight, SelectUp, SwitchPane, ToggleDeletions, ToggleTerminal,
+    ActivateRow, ClosePreview, CollapseRow, Commit, CopyDiff, CopySelection, ExitReview, ExpandRow,
+    FirstRow, LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerCancel,
+    PickerDown, PickerUp, PreviousFile, Refresh, ReviewBranch, SelectAllText, SelectDown,
+    SelectLeft, SelectRight, SelectUp, SwitchPane, ToggleDeletions, ToggleSidebar, ToggleTerminal,
 };
 use give::{
+    branches,
     git::{ChangedFile, Diff, LineKind, Repository, Snapshot},
-    preview,
+    path_reference, preview,
     preview_cache::{Key, PreviewCache, Slot, Syntax},
+    recent,
     review::{self, Branch, Review},
     scrollbar,
     text_selection::{self, Point as TextPoint, Selection as TextSelection},
@@ -15,13 +17,15 @@ use give::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Disableable, Sizable, TitleBar,
+    ActiveTheme as _, Disableable, Sizable, TitleBar,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+    text::{TextView, TextViewStyle},
     tooltip::Tooltip,
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
@@ -44,6 +48,22 @@ const NAME_ADDED: u32 = 0x8fd3a4;
 const NAME_DELETED: u32 = 0x75808c;
 const NAME_UNTRACKED: u32 = 0xe08e98;
 const LINE_HEIGHT: f32 = 26.;
+
+/// What the left tree lists: only changed paths (the default) or every project file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeMode {
+    Changes,
+    Catalog,
+}
+
+impl TreeMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Changes => "CHANGES",
+            Self::Catalog => "CATALOG",
+        }
+    }
+}
 const TREE_HEIGHT: f32 = 27.;
 
 pub struct Give {
@@ -56,12 +76,22 @@ pub struct Give {
     terminal_visible: bool,
     terminal_width: f32,
     terminal_dragging: bool,
+    sidebar_visible: bool,
+    sidebar_width: f32,
+    sidebar_dragging: bool,
+    /// What the open context menu's "Copy path" copies, set by the right-clicked row.
+    context_copy: Option<ContextCopy>,
     snapshot: Snapshot,
     tree: Vec<TreeRow>,
     tree_cursor: Option<usize>,
     tree_request: u64,
     tree_task: Option<Task<()>>,
     collapsed: HashSet<PathBuf>,
+    tree_mode: TreeMode,
+    /// Catalog directories start collapsed; these are open.
+    catalog_expanded: HashSet<PathBuf>,
+    /// The catalog first opens the directories of changed files, once per project.
+    catalog_seeded: bool,
     focus_left: bool,
     commit_open: bool,
     scrollbar_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -83,7 +113,17 @@ pub struct Give {
     current_slot: Option<Arc<Slot>>,
     syntax_pending: HashSet<(Key, bool, usize)>,
     selected: Option<PathBuf>,
+    /// Open preview tabs in display order; `selected` is the active one.
+    tabs: Vec<PathBuf>,
+    /// An explicitly closed tab stays closed across tree rebuilds and Git polling.
+    preview_closed: bool,
     diff: Arc<Diff>,
+    /// Markdown and SVG files open rendered; this shows their source with changes.
+    show_source: bool,
+    /// The decoded image for an image file, keyed by its version.
+    image: Option<(Key, ImageState)>,
+    /// Markdown text joined from `diff`, rebuilt when the diff changes.
+    markdown: RefCell<Option<(Arc<Diff>, SharedString)>>,
     filter: String,
     filter_input: Entity<InputState>,
     commit_input: Entity<InputState>,
@@ -109,6 +149,8 @@ pub struct Give {
     /// `--review` waits for the repository to open.
     pending_review: Option<String>,
     picker_open: bool,
+    picker_mode: BranchPickerMode,
+    branch_button_bounds: Rc<Cell<Bounds<Pixels>>>,
     picker_request: u64,
     picker_note: Option<String>,
     branches: Vec<Branch>,
@@ -117,7 +159,38 @@ pub struct Give {
     branch_query: String,
     branch_cursor: usize,
     branch_scroll: UniformListScrollHandle,
+    /// Recently opened project roots, newest first.
+    recent: Vec<PathBuf>,
     _subscriptions: Vec<Subscription>,
+}
+
+enum ImageState {
+    Loading,
+    Ready(crate::image_view::Decoded),
+    Failed(SharedString),
+}
+
+/// What the preview shows instead of source lines.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rendered {
+    Markdown,
+    Image,
+}
+
+fn markdown_path(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        matches!(
+            ext.to_string_lossy().to_lowercase().as_str(),
+            "md" | "markdown" | "mdx"
+        )
+    })
+}
+
+/// A "Copy path" menu item: its label and the clipboard text.
+#[derive(Clone)]
+struct ContextCopy {
+    label: SharedString,
+    text: String,
 }
 
 /// A branch picker row: a listed branch, or the typed name as given.
@@ -127,6 +200,18 @@ enum PickerRow {
     Typed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BranchPickerMode {
+    Review,
+    Switch,
+}
+
+enum BranchOperation {
+    Switch(Branch),
+    Fetch,
+    Pull,
+}
+
 impl Give {
     pub fn new(
         initial: Option<PathBuf>,
@@ -134,8 +219,7 @@ impl Give {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter changed files…"));
+        let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
         let commit_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Describe your changes…"));
         let branch_input =
@@ -174,14 +258,21 @@ impl Give {
             terminal: None,
             terminals: HashMap::new(),
             terminal_visible: false,
-            terminal_width: 440.,
+            terminal_width: 528.,
             terminal_dragging: false,
+            sidebar_visible: true,
+            sidebar_width: 270.,
+            sidebar_dragging: false,
+            context_copy: None,
             snapshot: Snapshot::default(),
             tree: Vec::new(),
             tree_cursor: None,
             tree_request: 0,
             tree_task: None,
             collapsed: HashSet::new(),
+            tree_mode: TreeMode::Changes,
+            catalog_expanded: HashSet::new(),
+            catalog_seeded: false,
             focus_left: true,
             commit_open: false,
             scrollbar_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -202,7 +293,12 @@ impl Give {
             current_slot: None,
             syntax_pending: HashSet::new(),
             selected: None,
+            tabs: Vec::new(),
+            preview_closed: false,
             diff: Arc::default(),
+            show_source: false,
+            image: None,
+            markdown: RefCell::new(None),
             filter: String::new(),
             filter_input,
             commit_input,
@@ -225,6 +321,8 @@ impl Give {
             review_error: None,
             pending_review: review,
             picker_open: false,
+            picker_mode: BranchPickerMode::Review,
+            branch_button_bounds: Rc::new(Cell::new(Bounds::default())),
             picker_request: 0,
             picker_note: None,
             branches: Vec::new(),
@@ -233,8 +331,12 @@ impl Give {
             branch_query: String::new(),
             branch_cursor: 0,
             branch_scroll: UniformListScrollHandle::new(),
+            recent: recent::store()
+                .map(|file| recent::load(&file))
+                .unwrap_or_default(),
             _subscriptions: subscriptions,
         };
+        crate::update_dock_menu(&this.recent, cx);
         cx.background_executor()
             .spawn(async { preview::warm_up() })
             .detach();
@@ -253,7 +355,34 @@ impl Give {
         this
     }
 
+    fn catalog(&self) -> bool {
+        self.tree_mode == TreeMode::Catalog && self.review_branch.is_none()
+    }
+
+    fn set_tree_mode(&mut self, mode: TreeMode, cx: &mut Context<Self>) {
+        if self.tree_mode == mode || self.review_branch.is_some() {
+            return;
+        }
+        self.tree_mode = mode;
+        self.files_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        if mode == TreeMode::Catalog && self.snapshot.catalog.is_empty() {
+            // The in-flight poll lacks the file list; this refresh replaces it.
+            self.snapshot_request += 1;
+            self.refreshing = false;
+            self.refresh(cx);
+        } else {
+            self.rebuild_tree(false, cx);
+        }
+        cx.notify();
+    }
+
     fn rebuild_tree(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        let catalog = self.catalog();
+        if catalog && !self.catalog_seeded && !self.snapshot.catalog.is_empty() {
+            self.catalog_seeded = true;
+            self.catalog_expanded
+                .extend(tree::changed_directories(&self.snapshot.files));
+        }
         self.tree_request += 1;
         let request = self.tree_request;
         let epoch = self.epoch;
@@ -269,20 +398,31 @@ impl Give {
                         return None;
                     }
                     Some((
-                        this.snapshot.files.clone(),
-                        this.collapsed.clone(),
+                        if catalog {
+                            this.snapshot.catalog.clone()
+                        } else {
+                            this.snapshot.files.clone()
+                        },
+                        if catalog {
+                            this.catalog_expanded.clone()
+                        } else {
+                            this.collapsed.clone()
+                        },
                         this.filter.clone(),
                     ))
                 })
                 .ok()
                 .flatten();
-            let Some((files, mut collapsed, filter)) = state else {
+            let Some((files, mut folders, filter)) = state else {
                 return;
             };
-            let (rows, collapsed) = cx
+            let (rows, folders) = cx
                 .background_executor()
                 .spawn(async move {
-                    tree::prune_collapsed(&mut collapsed, &files);
+                    // A catalog still loading must not forget its open folders.
+                    if !files.is_empty() {
+                        tree::prune_collapsed(&mut folders, &files);
+                    }
                     let files: Vec<_> = files
                         .into_iter()
                         .filter(|file| {
@@ -290,36 +430,41 @@ impl Give {
                                 || file.path.to_string_lossy().to_lowercase().contains(&filter)
                         })
                         .collect();
-                    let expanded = HashSet::new();
-                    let rows = tree::build_tree(
-                        &files,
-                        if filter.is_empty() {
-                            &collapsed
-                        } else {
-                            &expanded
-                        },
-                    );
-                    (rows, collapsed)
+                    let rows = if catalog {
+                        tree::build_catalog(&files, &folders, !filter.is_empty())
+                    } else if filter.is_empty() {
+                        tree::build_tree(&files, &folders)
+                    } else {
+                        tree::build_tree(&files, &HashSet::new())
+                    };
+                    (rows, folders)
                 })
                 .await;
             let _ = view.update(cx, |this, cx| {
                 if request != this.tree_request || epoch != this.epoch {
                     return;
                 }
-                this.apply_tree(rows, collapsed);
+                if catalog != this.catalog() {
+                    return;
+                }
+                if catalog {
+                    this.catalog_expanded = folders;
+                } else {
+                    this.collapsed = folders;
+                }
+                this.apply_tree(rows);
                 this.load_diff(true, cx);
                 cx.notify();
             });
         }));
     }
 
-    fn apply_tree(&mut self, rows: Vec<TreeRow>, collapsed: HashSet<PathBuf>) {
+    fn apply_tree(&mut self, rows: Vec<TreeRow>) {
         let previous = self
             .tree_cursor
             .and_then(|i| self.tree.get(i))
             .and_then(|row| row.path().map(|p| (p.to_owned(), row.untracked)));
         self.tree = rows;
-        self.collapsed = collapsed;
         self.tree_cursor = previous
             .and_then(|(path, untracked)| {
                 self.tree
@@ -334,14 +479,112 @@ impl Give {
                     })
             })
             .or_else(|| self.tree.iter().position(TreeRow::navigable));
-        let selected = self.tree_cursor.and_then(|i| match &self.tree[i].kind {
+        // Tabs of files that are no longer listed close; the cursor file replaces a
+        // closed active tab.
+        let listed = if self.catalog() {
+            &self.snapshot.catalog
+        } else {
+            &self.snapshot.files
+        };
+        let files: HashSet<_> = listed.iter().map(|f| &f.path).collect();
+        let active = self.active_tab();
+        self.tabs.retain(|path| files.contains(path));
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|path| !files.contains(path))
+        {
+            self.selected = None;
+            self.reset_preview_position();
+        }
+        if self.selected.is_some() || self.preview_closed {
+            return;
+        }
+        let cursor_file = self.tree_cursor.and_then(|i| match &self.tree[i].kind {
             RowKind::File(file) => Some(file.path.clone()),
             _ => None,
         });
-        if self.selected != selected {
-            self.selected = selected;
-            self.reset_preview_position();
+        if let Some(path) = cursor_file {
+            if !self.tabs.contains(&path) {
+                let index = active.unwrap_or(self.tabs.len()).min(self.tabs.len());
+                self.tabs.insert(index, path.clone());
+            }
+            self.selected = Some(path);
+        } else if let Some(index) = active.filter(|_| !self.tabs.is_empty()) {
+            self.selected = Some(self.tabs[index.min(self.tabs.len() - 1)].clone());
         }
+    }
+
+    fn active_tab(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        self.tabs.iter().position(|path| path == selected)
+    }
+
+    /// Shows `path` in the preview. An open tab is activated; otherwise the file
+    /// replaces the active tab, or opens in a new tab after it with `new_tab`.
+    /// Returns whether the shown file changed.
+    fn show_file(&mut self, path: PathBuf, new_tab: bool) -> bool {
+        self.preview_closed = false;
+        if self.selected.as_ref() == Some(&path) {
+            return false;
+        }
+        if !self.tabs.contains(&path) {
+            match self.active_tab() {
+                Some(index) if new_tab => self.tabs.insert(index + 1, path.clone()),
+                Some(index) => self.tabs[index] = path.clone(),
+                None => self.tabs.push(path.clone()),
+            }
+        }
+        self.selected = Some(path);
+        self.reset_preview_position();
+        true
+    }
+
+    fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.tabs.get(index).cloned() else {
+            return;
+        };
+        if let Some(row) = self
+            .tree
+            .iter()
+            .position(|row| row.path() == Some(path.as_path()))
+        {
+            self.tree_cursor = Some(row);
+            self.files_scroll.scroll_to_item(row, ScrollStrategy::Top);
+        }
+        if self.show_file(path, false) {
+            self.load_diff(false, cx);
+        }
+        self.focus_left = false;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let path = self.tabs.remove(index);
+        if self.selected.as_ref() != Some(&path) {
+            cx.notify();
+            return;
+        }
+        if !self.tabs.is_empty() {
+            self.selected = None;
+            self.activate_tab(index.min(self.tabs.len() - 1), window, cx);
+            return;
+        }
+        self.selected = None;
+        self.preview_closed = true;
+        self.preview_request += 1;
+        self.preview_loading = false;
+        self.reset_preview_position();
+        self.scrollbar_drag = None;
+        self.terminal_dragging = false;
+        self.focus_left = true;
+        self.terminal_visible = true;
+        self.activate_project_terminal(window, cx);
+        cx.notify();
     }
 
     fn reset_preview_position(&mut self) {
@@ -356,6 +599,7 @@ impl Give {
         self.preview_selecting = false;
         self.text_layouts.clear();
         self.change_index = None;
+        self.show_source = false;
     }
 
     fn open_picker(&mut self, _: &OpenRepository, window: &mut Window, cx: &mut Context<Self>) {
@@ -388,7 +632,7 @@ impl Give {
         .detach();
     }
 
-    fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -399,9 +643,10 @@ impl Give {
         self.preview_request += 1;
         self.notice = "Opening repository…".into();
         self.error = false;
+        let catalog = self.tree_mode == TreeMode::Catalog;
         let task = cx.background_executor().spawn(async move {
             let repo = Repository::open(&path)?;
-            let snapshot = repo.snapshot()?;
+            let snapshot = repo.snapshot_with(catalog)?;
             anyhow::Ok((repo, snapshot))
         });
         cx.spawn_in(window, async move |view, cx| {
@@ -417,6 +662,7 @@ impl Give {
                             "{} — give",
                             repo.root.file_name().unwrap_or_default().to_string_lossy()
                         ));
+                        this.remember_project(repo.root.clone(), cx);
                         this.repo = Some(repo);
                         this.activate_project_terminal(window, cx);
                         this.cache = PreviewCache::default();
@@ -426,9 +672,13 @@ impl Give {
                         this.preview_target = None;
                         this.snapshot = snapshot;
                         this.selected = None;
+                        this.tabs.clear();
+                        this.preview_closed = false;
                         this.tree.clear();
                         this.tree_cursor = None;
                         this.collapsed.clear();
+                        this.catalog_expanded.clear();
+                        this.catalog_seeded = false;
                         this.focus_left = true;
                         this.filter.clear();
                         this.filter_input
@@ -457,6 +707,19 @@ impl Give {
         cx.notify();
     }
 
+    fn remember_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        recent::remember(&mut self.recent, &root);
+        crate::update_dock_menu(&self.recent, cx);
+        if let Some(file) = recent::store() {
+            let projects = self.recent.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = recent::save(&file, &projects) {
+                    eprintln!("give: could not save recent projects: {error}");
+                }
+            });
+        }
+    }
+
     /// ⌘R: reload the review (fetch included) or the working tree.
     fn manual_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.review_branch.clone() {
@@ -477,9 +740,10 @@ impl Give {
         self.snapshot_request += 1;
         let request = self.snapshot_request;
         let epoch = self.epoch;
+        let catalog = self.catalog();
         let task = cx
             .background_executor()
-            .spawn(async move { repo.snapshot() });
+            .spawn(async move { repo.snapshot_with(catalog) });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
@@ -489,7 +753,8 @@ impl Give {
                 this.refreshing = false;
                 match result {
                     Ok(snapshot) => {
-                        let changed_tree = this.snapshot.files != snapshot.files;
+                        let changed_tree = this.snapshot.files != snapshot.files
+                            || this.snapshot.catalog != snapshot.catalog;
                         this.cache.retain_versions(&snapshot.versions);
                         this.snapshot = snapshot;
                         if changed_tree {
@@ -507,10 +772,9 @@ impl Give {
 
     fn load_diff(&mut self, quiet: bool, cx: &mut Context<Self>) {
         let file = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| Some(&file.path) == self.selected.as_ref())
+            .selected
+            .as_ref()
+            .and_then(|path| self.snapshot.file(path))
             .cloned();
         let (Some(repo), Some(file)) = (self.repo.clone(), file) else {
             self.preview_request += 1;
@@ -519,6 +783,7 @@ impl Give {
             self.diff = Arc::default();
             self.syntax = Arc::default();
             self.preview_loading = false;
+            self.set_image(None, cx);
             self.prefetch_neighbors(cx);
             return;
         };
@@ -526,6 +791,7 @@ impl Give {
             path: file.path.clone(),
             version: self.snapshot.versions[&file.path],
         };
+        self.load_image(&repo, &file, &key, cx);
         let show = self.show_deletions;
         if self.preview_target.as_ref() == Some(&(key.clone(), show)) {
             self.prefetch_neighbors(cx);
@@ -604,6 +870,106 @@ impl Give {
         })
         .detach();
         self.prefetch_neighbors(cx);
+    }
+
+    fn load_image(
+        &mut self,
+        repo: &Repository,
+        file: &ChangedFile,
+        key: &Key,
+        cx: &mut Context<Self>,
+    ) {
+        if crate::image_view::format(&file.path).is_none() {
+            self.set_image(None, cx);
+            return;
+        }
+        if self.image.as_ref().is_some_and(|(shown, _)| shown == key) {
+            return;
+        }
+        self.set_image(Some((key.clone(), ImageState::Loading)), cx);
+        let (repo, file, review) = (repo.clone(), file.clone(), self.review.clone());
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::image_view::load(&repo, &file, review.as_deref()) });
+        let key = key.clone();
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let state = match result {
+                    Ok(decoded) => ImageState::Ready(decoded),
+                    Err(error) => ImageState::Failed(format!("{error:#}").into()),
+                };
+                if this.image.as_ref().is_some_and(|(shown, _)| *shown == key) {
+                    this.set_image(Some((key, state)), cx);
+                    cx.notify();
+                } else if let ImageState::Ready(decoded) = state {
+                    cx.drop_image(decoded.image, None);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Replaces the shown image, freeing the previous one's GPU texture.
+    fn set_image(&mut self, image: Option<(Key, ImageState)>, cx: &mut Context<Self>) {
+        if let Some((_, ImageState::Ready(old))) = std::mem::replace(&mut self.image, image) {
+            // Deferred so the window that is updating now releases it too.
+            cx.defer(move |cx| cx.drop_image(old.image, None));
+        }
+    }
+
+    fn rendered(&self) -> Option<Rendered> {
+        let path = self.selected.as_ref()?;
+        let svg = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"));
+        if svg || markdown_path(path) {
+            if self.show_source {
+                None
+            } else if svg {
+                Some(Rendered::Image)
+            } else {
+                Some(Rendered::Markdown)
+            }
+        } else {
+            crate::image_view::format(path).map(|_| Rendered::Image)
+        }
+    }
+
+    /// Whether the shown file can switch between rendered content and source.
+    fn has_source_toggle(&self) -> bool {
+        self.selected.as_ref().is_some_and(|path| {
+            markdown_path(path)
+                || path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+        })
+    }
+
+    fn toggle_source(&mut self, cx: &mut Context<Self>) {
+        self.show_source = !self.show_source;
+        self.text_selection = None;
+        cx.notify();
+    }
+
+    fn markdown_text(&self) -> SharedString {
+        let mut cache = self.markdown.borrow_mut();
+        if let Some((diff, text)) = cache.as_ref()
+            && Arc::ptr_eq(diff, &self.diff)
+        {
+            return text.clone();
+        }
+        let text: SharedString = self
+            .diff
+            .lines
+            .iter()
+            .filter(|line| line.kind != LineKind::Removed)
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        *cache = Some((self.diff.clone(), text.clone()));
+        text
     }
 
     fn preview_error(&mut self, key: &Key, error: String, cx: &mut Context<Self>) {
@@ -732,13 +1098,7 @@ impl Give {
                 break;
             }
             let path = &candidate.path;
-            let Some(file) = self
-                .snapshot
-                .files
-                .iter()
-                .find(|file| &file.path == path)
-                .cloned()
-            else {
+            let Some(file) = self.snapshot.file(path).cloned() else {
                 continue;
             };
             let Some(version) = self.snapshot.versions.get(&file.path).copied() else {
@@ -778,17 +1138,25 @@ impl Give {
     }
 
     fn select_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_row(index, false, window, cx);
+    }
+
+    /// Moves the tree cursor to `index`; a file opens in the active tab, or in a new
+    /// tab with `new_tab`. Folders keep the open preview.
+    fn open_row(
+        &mut self,
+        index: usize,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.tree.get(index).is_some_and(TreeRow::navigable) {
             return;
         }
         self.tree_cursor = Some(index);
-        let selected = match &self.tree[index].kind {
-            RowKind::File(file) => Some(file.path.clone()),
-            _ => None,
-        };
-        if self.selected != selected {
-            self.selected = selected;
-            self.reset_preview_position();
+        if let RowKind::File(file) = &self.tree[index].kind
+            && self.show_file(file.path.clone(), new_tab)
+        {
             self.load_diff(false, cx);
         }
         self.focus_left = true;
@@ -803,12 +1171,24 @@ impl Give {
         if !self.focus_left {
             return;
         }
+        if matches!(self.tree[index].kind, RowKind::File(_)) {
+            self.select_row(index, window, cx);
+            self.focus_left = false;
+            return;
+        }
         if let RowKind::Directory { path, expanded } = &self.tree[index].kind {
             let path = path.clone();
-            if *expanded {
-                self.collapsed.insert(path);
-            } else {
+            let expand = !*expanded;
+            if self.catalog() {
+                if expand {
+                    self.catalog_expanded.insert(path);
+                } else {
+                    self.catalog_expanded.remove(&path);
+                }
+            } else if expand {
                 self.collapsed.remove(&path);
+            } else {
+                self.collapsed.insert(path);
             }
             self.rebuild_tree(false, cx);
             self.focus.focus(window);
@@ -831,6 +1211,7 @@ impl Give {
         }
         if expand {
             if matches!(self.tree[index].kind, RowKind::File(_)) {
+                self.select_row(index, window, cx);
                 self.focus_left = false;
                 cx.notify();
             } else {
@@ -900,6 +1281,9 @@ impl Give {
     }
 
     fn toggle_deletions(&mut self, cx: &mut Context<Self>) {
+        if self.has_source_toggle() && !self.show_source {
+            self.show_source = true;
+        }
         self.text_selection = None;
         self.text_layouts.clear();
         self.show_deletions = !self.show_deletions;
@@ -908,6 +1292,9 @@ impl Give {
     }
 
     fn next_change(&mut self, cx: &mut Context<Self>) {
+        if self.has_source_toggle() && !self.show_source {
+            self.show_source = true;
+        }
         let blocks = preview::change_blocks(&self.diff.lines);
         if blocks.is_empty() {
             self.notice = "No changed lines in this file".into();
@@ -942,6 +1329,7 @@ impl Give {
             return;
         }
         let unstage = !all && file.as_ref().is_some_and(|f| f.staged() && !f.unstaged());
+        let catalog = self.catalog();
         self.start_operation(
             if unstage {
                 "Unstaging changes…"
@@ -956,7 +1344,7 @@ impl Give {
             } else {
                 repo.stage(file.as_ref())?;
             }
-            repo.snapshot()
+            repo.snapshot_with(catalog)
         });
         self.finish_operation(task, "Index updated", false, window, cx);
     }
@@ -980,9 +1368,10 @@ impl Give {
             return;
         }
         self.start_operation("Committing staged changes…", cx);
+        let catalog = self.catalog();
         let task = cx.background_executor().spawn(async move {
             repo.commit(&message)?;
-            repo.snapshot()
+            repo.snapshot_with(catalog)
         });
         self.finish_operation(task, "Commit created", true, window, cx);
     }
@@ -1065,6 +1454,8 @@ impl Give {
         self.tree_cursor = None;
         self.collapsed.clear();
         self.selected = None;
+        self.tabs.clear();
+        self.preview_closed = false;
         self.reset_preview_position();
         self.focus_left = true;
         self.notice = format!("Reviewing {branch}…");
@@ -1143,6 +1534,15 @@ impl Give {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_branch_picker(BranchPickerMode::Review, window, cx);
+    }
+
+    fn show_branch_picker(
+        &mut self,
+        mode: BranchPickerMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -1150,9 +1550,12 @@ impl Give {
             return;
         }
         self.picker_open = true;
+        self.picker_mode = mode;
         self.picker_note = None;
+        self.branches.clear();
         self.branch_query.clear();
         self.branch_cursor = 0;
+        self.branch_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.branch_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -1160,9 +1563,12 @@ impl Give {
         self.picker_request += 1;
         let request = self.picker_request;
         self.branches_loading = true;
-        // Known refs appear at once; a fetch then adds new remote branches.
+        // The review picker fetches automatically. Checkout exposes Fetch explicitly.
         cx.spawn(async move |view, cx| {
             for fetch in [false, true] {
+                if fetch && mode == BranchPickerMode::Switch {
+                    break;
+                }
                 let repo = repo.clone();
                 let result = cx
                     .background_executor()
@@ -1188,7 +1594,7 @@ impl Give {
                             Ok(branches) => this.set_branches(branches),
                             Err(error) => this.picker_note = Some(format!("{error:#}")),
                         }
-                        if fetch {
+                        if fetch || mode == BranchPickerMode::Switch {
                             this.branches_loading = false;
                         }
                         cx.notify();
@@ -1241,7 +1647,8 @@ impl Give {
             .filter(|(_, branch)| branch.name.to_lowercase().contains(&query))
             .map(|(index, _)| PickerRow::Branch(index))
             .collect();
-        if !self.branch_query.is_empty()
+        if self.picker_mode == BranchPickerMode::Review
+            && !self.branch_query.is_empty()
             && !self
                 .branches
                 .iter()
@@ -1267,16 +1674,117 @@ impl Give {
     }
 
     fn confirm_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.picker_open {
+        if !self.picker_open || self.busy || self.opening {
             return;
         }
         let rows = self.picker_rows();
-        let branch = match rows.get(self.branch_cursor.min(rows.len().saturating_sub(1))) {
+        let row = rows.get(self.branch_cursor.min(rows.len().saturating_sub(1)));
+        if self.picker_mode == BranchPickerMode::Switch {
+            if let Some(PickerRow::Branch(index)) = row {
+                self.branch_operation(
+                    BranchOperation::Switch(self.branches[*index].clone()),
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
+        let branch = match row {
             Some(PickerRow::Branch(index)) => self.branches[*index].name.clone(),
             Some(PickerRow::Typed) => self.branch_query.clone(),
             None => return,
         };
         self.start_review(branch, window, cx);
+    }
+
+    fn branch_operation(
+        &mut self,
+        operation: BranchOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy
+            || self.opening
+            || self.review_step.is_some()
+            || (self.review_branch.is_some() && matches!(operation, BranchOperation::Pull))
+        {
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let fetching = matches!(operation, BranchOperation::Fetch);
+        let reviewing = self.review_branch.is_some();
+        let message = match &operation {
+            BranchOperation::Switch(_) => "Switching branch…",
+            BranchOperation::Fetch => "Fetching all remotes…",
+            BranchOperation::Pull => "Pulling current branch…",
+        };
+        // Cancel a branch-list read before it can overwrite the post-operation list.
+        self.picker_request += 1;
+        self.branches_loading = fetching;
+        self.picker_note = None;
+        self.start_operation(message, cx);
+        let catalog = self.catalog();
+        let task = cx.background_executor().spawn(async move {
+            let result = match operation {
+                BranchOperation::Switch(branch) => {
+                    branches::switch(&repo, &branch).map(|name| format!("Switched to {name}"))
+                }
+                BranchOperation::Fetch => review::fetch(&repo)
+                    .map(|()| "Fetch complete · remote branches updated".to_owned()),
+                BranchOperation::Pull => branches::pull(&repo)
+                    .map(|()| "Pull complete · current branch is up to date".to_owned()),
+            };
+            // Read back even after failure: a network operation may have updated refs.
+            (result, repo.snapshot_with(catalog), review::branches(&repo))
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let (result, snapshot, branches) = task.await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                this.branches_loading = false;
+                if reviewing && !fetching && result.is_ok() {
+                    this.epoch += 1;
+                    this.review_branch = None;
+                    this.review = None;
+                    this.review_error = None;
+                    this.review_step = None;
+                }
+                let mut errors = Vec::new();
+                match snapshot {
+                    Ok(snapshot) if this.review_branch.is_none() => {
+                        this.cache.retain_versions(&snapshot.versions);
+                        this.snapshot = snapshot;
+                        this.rebuild_tree(false, cx);
+                    }
+                    Ok(_) => this.load_diff(true, cx),
+                    Err(error) => errors.push(format!("Refresh failed: {error:#}")),
+                }
+                match branches {
+                    Ok(branches) => this.set_branches(branches),
+                    Err(error) => errors.push(format!("Branch list failed: {error:#}")),
+                }
+                match result {
+                    Ok(message) => {
+                        this.notice = message;
+                        if !fetching {
+                            this.close_picker(window, cx);
+                        }
+                    }
+                    Err(error) => errors.insert(0, format!("{error:#}")),
+                }
+                if !errors.is_empty() {
+                    let error = errors.join("\n");
+                    if this.picker_open {
+                        this.picker_note = Some(error.clone());
+                    }
+                    this.show_error(error, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn show_error(&mut self, error: impl std::fmt::Display, cx: &mut Context<Self>) {
@@ -1469,6 +1977,12 @@ impl Give {
         }
     }
 
+    fn close_preview(&mut self, _: &ClosePreview, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.active_tab() {
+            self.close_tab(index, window, cx);
+        }
+    }
+
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_visible = !self.terminal_visible;
         self.activate_project_terminal(window, cx);
@@ -1476,6 +1990,88 @@ impl Give {
             self.focus.focus(window);
         }
         cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.sidebar_dragging = false;
+        // Arrow keys would otherwise move through a tree that is not on screen.
+        if !self.sidebar_visible && self.selected.is_some() {
+            self.focus_left = false;
+        }
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn absolute(&self, path: &std::path::Path) -> PathBuf {
+        self.repo
+            .as_ref()
+            .map_or_else(|| path.to_owned(), |repo| repo.root.join(path))
+    }
+
+    /// Right-click on a tree row: copy the file or folder's absolute path.
+    fn tree_context(&mut self, index: usize) {
+        let path = match self.tree.get(index).map(|row| &row.kind) {
+            Some(RowKind::File(file)) => &file.path,
+            Some(RowKind::Directory { path, .. }) => path,
+            _ => return,
+        };
+        self.context_copy = Some(ContextCopy {
+            label: "Copy path".into(),
+            text: self.absolute(path).to_string_lossy().into_owned(),
+        });
+    }
+
+    /// Right-click on a preview row: the selection with its lines when the row is
+    /// inside it, otherwise the clicked line.
+    fn preview_context(&mut self, row: usize) {
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        let path = self.absolute(&selected);
+        let selection = self
+            .text_selection
+            .filter(|selection| {
+                let (start, end) = selection.ordered();
+                (start.row..=end.row).contains(&row)
+            })
+            .and_then(|selection| path_reference::selection(&path, &self.diff.lines, selection));
+        self.context_copy = Some(match selection {
+            Some(text) => ContextCopy {
+                label: "Copy path with selection".into(),
+                text,
+            },
+            None => ContextCopy {
+                label: "Copy path with line".into(),
+                text: path_reference::line(&path, &self.diff.lines, row),
+            },
+        });
+    }
+
+    /// The tree and preview context menu; an empty menu does not open.
+    fn context_menu(
+        view: &WeakEntity<Self>,
+        menu: PopupMenu,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let Some(copy) = view
+            .upgrade()
+            .and_then(|view| view.read(cx).context_copy.clone())
+        else {
+            return menu;
+        };
+        let view = view.clone();
+        menu.item(
+            PopupMenuItem::new(copy.label.clone()).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy.text.clone()));
+                let _ = view.update(cx, |this, cx| {
+                    this.notice =
+                        format!("Copied {}", copy.text.lines().next().unwrap_or_default());
+                    this.error = false;
+                    cx.notify();
+                });
+            }),
+        )
     }
 
     fn activate_project_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1501,36 +2097,56 @@ impl Give {
     }
 
     fn terminal_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar = self.repo.is_none() || self.selected.is_some();
         let width = self
             .terminal_width
             .min((f32::from(window.viewport_size().width) - 600.).max(280.));
         div()
             .flex()
-            .w(px(width))
+            .when(sidebar, |el| el.w(px(width)).flex_shrink_0())
+            .when(!sidebar, |el| el.flex_1().min_w_0())
             .h_full()
-            .flex_shrink_0()
             .bg(rgb(PANEL))
-            .child(
-                div()
-                    .id("terminal-resize")
-                    .w(px(4.))
-                    .h_full()
-                    .cursor_col_resize()
-                    .bg(rgb(BORDER))
-                    .hover(|el| el.bg(rgb(ACCENT)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.terminal_dragging = true;
-                            cx.stop_propagation();
-                        }),
-                    ),
-            )
-            .when_some(self.terminal.clone(), |el, terminal| el.child(terminal))
+            .when(sidebar, |el| {
+                el.child(
+                    div()
+                        .id("terminal-resize")
+                        .w(px(4.))
+                        .h_full()
+                        .flex_shrink_0()
+                        .cursor_col_resize()
+                        .bg(rgb(BORDER))
+                        .hover(|el| el.bg(rgb(ACCENT)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.terminal_dragging = true;
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+            })
+            // The terminal takes what the handle leaves, so it can never squeeze the handle out.
+            .when_some(self.terminal.clone(), |el, terminal| {
+                el.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .child(terminal),
+                )
+            })
     }
 
     fn drag_ui(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_dragging {
+        if self.sidebar_dragging {
+            self.sidebar_width = f32::from(event.position.x).clamp(
+                180.,
+                (f32::from(window.viewport_size().width) * 0.6).max(180.),
+            );
+            cx.notify();
+        } else if self.terminal_dragging && (self.repo.is_none() || self.selected.is_some()) {
             self.terminal_width = (f32::from(window.viewport_size().width - event.position.x))
                 .clamp(
                     280.,
@@ -1546,6 +2162,7 @@ impl Give {
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let branch_bounds = self.branch_button_bounds.clone();
         let name = self
             .repo
             .as_ref()
@@ -1576,26 +2193,53 @@ impl Give {
                                         .child("REVIEW"),
                                 )
                             })
-                            .child(ui_icon(
-                                "branch",
-                                13.,
-                                if self.review_branch.is_some() {
-                                    ACCENT
-                                } else {
-                                    MUTED
-                                },
-                            ))
                             .child(
                                 div()
+                                    .id("current-branch")
+                                    .relative()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .hover(|el| el.bg(rgb(SURFACE)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if this.picker_open {
+                                            this.close_picker(window, cx);
+                                        } else {
+                                            this.show_branch_picker(
+                                                BranchPickerMode::Switch,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }))
                                     .text_color(rgb(if self.review_branch.is_some() {
                                         TEXT
                                     } else {
                                         MUTED
                                     }))
+                                    .child(ui_icon("branch", 13., MUTED))
                                     .child(
-                                        self.review_branch
-                                            .clone()
-                                            .unwrap_or_else(|| self.snapshot.branch.clone()),
+                                        div().max_w(px(300.)).truncate().child(
+                                            self.review_branch
+                                                .clone()
+                                                .unwrap_or_else(|| self.snapshot.branch.clone()),
+                                        ),
+                                    )
+                                    .child(ui_icon("chevron-down", 10., MUTED))
+                                    .child(
+                                        canvas(
+                                            move |bounds, _, _| branch_bounds.set(bounds),
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .inset_0(),
                                     ),
                             )
                             .when_some(self.review.as_ref(), |el, review| {
@@ -1615,6 +2259,35 @@ impl Give {
                     .pr_3()
                     .child(
                         div()
+                            .id("toggle-sidebar")
+                            .w(px(30.))
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .bg(rgb(if self.sidebar_visible {
+                                SURFACE
+                            } else {
+                                0x151e28
+                            }))
+                            .hover(|el| el.bg(rgb(SURFACE)))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Toggle left sidebar · ⌘1").build(window, cx)
+                            })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_sidebar(&ToggleSidebar, window, cx)
+                            }))
+                            .child(ui_icon(
+                                "panel-left",
+                                17.,
+                                if self.sidebar_visible { ACCENT } else { MUTED },
+                            )),
+                    )
+                    .child(
+                        div()
                             .id("toggle-terminal")
                             .w(px(30.))
                             .h(px(24.))
@@ -1630,7 +2303,7 @@ impl Give {
                             }))
                             .hover(|el| el.bg(rgb(SURFACE)))
                             .tooltip(|window, cx| {
-                                Tooltip::new("Toggle right terminal · ⌘B").build(window, cx)
+                                Tooltip::new("Toggle right terminal · ⌘2").build(window, cx)
                             })
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1676,17 +2349,80 @@ impl Give {
                                 cx.listener(|this, _, window, cx| this.manual_refresh(window, cx)),
                             ),
                     )
-                    .child(
+                    .child({
+                        let view = cx.entity().downgrade();
+                        let recent = self.recent.clone();
+                        let current = self.repo.as_ref().map(|repo| repo.root.clone());
                         Button::new("open")
                             .ghost()
                             .xsmall()
                             .label("Open project")
+                            .icon(gpui_component::Icon::empty().path("icons/chevron-down.svg"))
                             .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_picker(&OpenRepository, window, cx)
-                            })),
-                    ),
+                            .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, _| {
+                                let mut menu = menu.min_w(px(260.)).max_w(px(420.));
+                                let recent = recent
+                                    .iter()
+                                    .filter(|path| current.as_ref() != Some(*path))
+                                    .take(8)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                if !recent.is_empty() {
+                                    menu = menu.label("Recent projects");
+                                    for path in recent {
+                                        let view = view.clone();
+                                        let label = path.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::element(move |_, _| {
+                                                recent_project_label(&label)
+                                            })
+                                            .on_click(move |_, window, cx| {
+                                                let path = path.clone();
+                                                let _ = view.update(cx, |this, cx| {
+                                                    this.open(path, window, cx)
+                                                });
+                                            }),
+                                        );
+                                    }
+                                    menu = menu.separator();
+                                }
+                                let view = view.clone();
+                                menu.item(PopupMenuItem::new("Browse…").on_click(
+                                    move |_, window, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            this.open_picker(&OpenRepository, window, cx)
+                                        });
+                                    },
+                                ))
+                            })
+                    }),
             )
+    }
+
+    /// The sidebar title doubles as the Changes/Catalog switch.
+    fn tree_mode_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let current = self.tree_mode;
+        Button::new("tree-mode")
+            .ghost()
+            .xsmall()
+            .label(current.label())
+            .icon(gpui_component::Icon::empty().path("icons/chevron-down.svg"))
+            .disabled(self.opening)
+            .dropdown_menu_with_anchor(Corner::TopLeft, move |mut menu, _, _| {
+                for (mode, label) in [
+                    (TreeMode::Changes, "Changes"),
+                    (TreeMode::Catalog, "Catalog · all files"),
+                ] {
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(label).checked(mode == current).on_click(
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| this.set_tree_mode(mode, cx));
+                        },
+                    ));
+                }
+                menu
+            })
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1707,15 +2443,13 @@ impl Give {
             && !self.busy
             && !self.opening
             && !self.commit_input.read(cx).value().trim().is_empty();
-        div()
+        let view = cx.entity().downgrade();
+        let content = div()
             .flex()
             .flex_col()
-            .w(px(270.))
-            .flex_shrink_0()
+            .flex_1()
+            .min_w_0()
             .h_full()
-            .bg(rgb(PANEL))
-            .border_r_1()
-            .border_color(rgb(BORDER))
             .child(
                 div()
                     .h(px(36.))
@@ -1730,7 +2464,8 @@ impl Give {
                             .gap_2()
                             .text_size(px(11.))
                             .text_color(rgb(MUTED))
-                            .child(if reviewing { "BRANCH" } else { "CHANGES" })
+                            .when(reviewing, |el| el.child("BRANCH"))
+                            .when(!reviewing, |el| el.child(self.tree_mode_menu(cx)))
                             .child(
                                 div()
                                     .text_color(rgb(ACCENT))
@@ -1765,6 +2500,7 @@ impl Give {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
+                    .capture_any_mouse_down(cx.listener(clear_context_copy))
                     .when(!self.tree.is_empty(), |el| {
                         el.child(
                             uniform_list(
@@ -1811,6 +2547,8 @@ impl Give {
                                                     };
                                                     let badge = if this.review_branch.is_some() {
                                                         file.index.to_string()
+                                                    } else if file.clean() {
+                                                        String::new()
                                                     } else if file.untracked() {
                                                         "U".into()
                                                     } else if file.index == 'D'
@@ -1828,6 +2566,12 @@ impl Give {
                                             };
                                             let name_color = match &row.kind {
                                                 RowKind::File(file) => file_name_color(file),
+                                                // Catalog folders holding changes are tinted.
+                                                RowKind::Directory { .. }
+                                                    if row.changed && this.catalog() =>
+                                                {
+                                                    NAME_MODIFIED
+                                                }
                                                 _ if navigable => TEXT,
                                                 _ => MUTED,
                                             };
@@ -1843,9 +2587,20 @@ impl Give {
                                                 .when(navigable, |el| {
                                                     el.cursor_pointer()
                                                         .hover(|el| el.bg(rgb(SURFACE)))
+                                                        .on_mouse_down(
+                                                            MouseButton::Right,
+                                                            cx.listener(move |this, _, _, _| {
+                                                                this.tree_context(index)
+                                                            }),
+                                                        )
                                                         .on_click(cx.listener(
-                                                            move |this, _, window, cx| {
-                                                                this.select_row(index, window, cx);
+                                                            move |this, event: &ClickEvent, window, cx| {
+                                                                this.open_row(
+                                                                    index,
+                                                                    event.modifiers().secondary(),
+                                                                    window,
+                                                                    cx,
+                                                                );
                                                                 if matches!(
                                                                     this.tree[index].kind,
                                                                     RowKind::Directory { .. }
@@ -1957,11 +2712,14 @@ impl Give {
                                     error.clone()
                                 } else if reviewing {
                                     "No changes in this branch".to_owned()
+                                } else if self.catalog() {
+                                    "No files".to_owned()
                                 } else {
                                     "No changed files".to_owned()
                                 }),
                         )
-                    }),
+                    })
+                    .context_menu(move |menu, _, cx| Self::context_menu(&view, menu, cx)),
             )
             .when(reviewing, |el| {
                 el.child(
@@ -2034,7 +2792,33 @@ impl Give {
                             )
                         }),
                 )
-            })
+            });
+        // Each context menu keeps its state under its ancestors' ids.
+        div()
+            .id("sidebar")
+            .flex()
+            .w(px(self.sidebar_width))
+            .flex_shrink_0()
+            .h_full()
+            .bg(rgb(PANEL))
+            .child(content)
+            .child(
+                div()
+                    .id("sidebar-resize")
+                    .w(px(4.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .cursor_col_resize()
+                    .bg(rgb(BORDER))
+                    .hover(|el| el.bg(rgb(ACCENT)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.sidebar_dragging = true;
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
     }
 
     fn preview_bottom_padding(&self) -> usize {
@@ -2179,25 +2963,22 @@ impl Give {
             )
     }
 
-    fn preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn preview(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rendered = self.rendered();
         let path = self
             .selected
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let name = self
-            .selected
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Review".into());
         let unstage = self
             .snapshot
             .files
             .iter()
             .find(|f| Some(&f.path) == self.selected.as_ref())
             .is_some_and(|f| f.staged() && !f.unstaged());
+        let view = cx.entity().downgrade();
         div()
+            .id("preview")
             .flex()
             .flex_col()
             .flex_1()
@@ -2212,20 +2993,73 @@ impl Give {
                     .bg(rgb(PANEL))
                     .border_b_1()
                     .border_color(rgb(BORDER))
+                    .when(self.tabs.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .px_4()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .bg(rgb(BACKGROUND))
+                                .border_r_1()
+                                .border_color(rgb(BORDER))
+                                .border_b_2()
+                                .text_size(px(13.))
+                                .child(ui_icon("code", 14., ACCENT))
+                                .child("Review"),
+                        )
+                    })
                     .child(
                         div()
-                            .px_4()
-                            .h_full()
+                            .id("preview-tabs")
                             .flex()
-                            .items_center()
-                            .gap_2()
-                            .bg(rgb(BACKGROUND))
-                            .border_r_1()
-                            .border_color(rgb(BORDER))
-                            .border_b_2()
-                            .text_size(px(13.))
-                            .child(ui_icon("code", 14., ACCENT))
-                            .child(name),
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .children(self.tabs.iter().enumerate().map(|(index, path)| {
+                                let active = self.selected.as_ref() == Some(path);
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                div()
+                                    .id(("preview-tab", index))
+                                    .pl_4()
+                                    .pr_2()
+                                    .h_full()
+                                    .flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .bg(rgb(if active { BACKGROUND } else { PANEL }))
+                                    .border_r_1()
+                                    .border_color(rgb(BORDER))
+                                    .when(active, |el| el.border_b_2())
+                                    .when(!active, |el| {
+                                        el.cursor_pointer().hover(|el| el.bg(rgb(SURFACE)))
+                                    })
+                                    .text_size(px(13.))
+                                    .text_color(rgb(if active { TEXT } else { MUTED }))
+                                    .child(ui_icon(
+                                        "code",
+                                        14.,
+                                        if active { ACCENT } else { MUTED },
+                                    ))
+                                    .child(name)
+                                    .child(
+                                        Button::new(("close-preview", index))
+                                            .ghost()
+                                            .xsmall()
+                                            .label("×")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.close_tab(index, window, cx)
+                                            })),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.activate_tab(index, window, cx)
+                                    }))
+                            })),
                     ),
             )
             .child(
@@ -2255,49 +3089,68 @@ impl Give {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(GREEN))
-                                        .child(format!("+{}", self.diff.additions)),
-                                )
-                                .child(
-                                    div()
-                                        .mr_2()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(RED))
-                                        .child(format!("−{}", self.diff.deletions)),
-                                )
-                                .child(
-                                    Button::new("deletions")
-                                        .ghost()
-                                        .xsmall()
-                                        .label(if self.show_deletions {
-                                            if self.terminal_visible {
-                                                "− D"
+                                .when(self.has_source_toggle(), |el| {
+                                    el.child(
+                                        Button::new("source")
+                                            .ghost()
+                                            .xsmall()
+                                            .label(if self.show_source {
+                                                "Rendered"
                                             } else {
-                                                "Hide deletions  D"
-                                            }
-                                        } else {
-                                            if self.terminal_visible {
-                                                "+ D"
+                                                "Source"
+                                            })
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.toggle_source(cx)
+                                                }),
+                                            ),
+                                    )
+                                })
+                                .when(rendered.is_none(), |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(GREEN))
+                                            .child(format!("+{}", self.diff.additions)),
+                                    )
+                                    .child(
+                                        div()
+                                            .mr_2()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(RED))
+                                            .child(format!("−{}", self.diff.deletions)),
+                                    )
+                                    .child(
+                                        Button::new("deletions")
+                                            .ghost()
+                                            .xsmall()
+                                            .label(if self.show_deletions {
+                                                if self.terminal_visible {
+                                                    "− D"
+                                                } else {
+                                                    "Hide deletions  D"
+                                                }
                                             } else {
-                                                "Show deletions  D"
-                                            }
-                                        })
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.toggle_deletions(cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("next-change")
-                                        .ghost()
-                                        .xsmall()
-                                        .label("Next ↓")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.next_change(cx)),
-                                        ),
-                                )
+                                                if self.terminal_visible {
+                                                    "+ D"
+                                                } else {
+                                                    "Show deletions  D"
+                                                }
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_deletions(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("next-change")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Next ↓")
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.next_change(cx)),
+                                            ),
+                                    )
+                                })
                                 .when(self.review_branch.is_none(), |el| {
                                     el.child(
                                         Button::new("stage-file")
@@ -2333,7 +3186,15 @@ impl Give {
                     )
                 })
             })
-            .when(self.selected.is_some(), |el| {
+            .when(
+                self.selected.is_some() && rendered == Some(Rendered::Markdown),
+                |el| el.child(self.markdown_view(window, cx)),
+            )
+            .when(
+                self.selected.is_some() && rendered == Some(Rendered::Image),
+                |el| el.child(self.image_view()),
+            )
+            .when(self.selected.is_some() && rendered.is_none(), |el| {
                 el.when_some(self.diff.notice.clone(), |el, notice| {
                     el.child(
                         div()
@@ -2350,6 +3211,7 @@ impl Give {
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
+                        .capture_any_mouse_down(cx.listener(clear_context_copy))
                         .child(
                             uniform_list(
                                 "diff",
@@ -2444,6 +3306,12 @@ impl Give {
                                                         )
                                                     }),
                                                 )
+                                                .on_mouse_down(
+                                                    MouseButton::Right,
+                                                    cx.listener(move |this, _, _, _| {
+                                                        this.preview_context(index)
+                                                    }),
+                                                )
                                                 .when(
                                                     this.show_deletions
                                                         || this.review_branch.is_some(),
@@ -2513,9 +3381,90 @@ impl Give {
                             .min_w_0()
                             .min_h_0(),
                         )
-                        .child(self.overview(cx)),
+                        .child(self.overview(cx))
+                        .context_menu(move |menu, _, cx| Self::context_menu(&view, menu, cx)),
                 )
             })
+    }
+
+    fn markdown_view(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = format!(
+            "markdown-{}",
+            self.selected
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .unwrap_or_default()
+        );
+        let style = TextViewStyle {
+            is_dark: true,
+            highlight_theme: cx.theme().highlight_theme.clone(),
+            ..TextViewStyle::default()
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .text_size(px(14.))
+            .text_color(rgb(TEXT))
+            .child(
+                TextView::markdown(SharedString::from(id), self.markdown_text(), window, cx)
+                    .style(style)
+                    .selectable(true)
+                    .scrollable(true)
+                    .flex_1()
+                    .min_h_0()
+                    .px_8()
+                    .py_6(),
+            )
+    }
+
+    fn image_view(&self) -> impl IntoElement {
+        let content = match self.image.as_ref().map(|(_, state)| state) {
+            Some(ImageState::Ready(decoded)) => div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(
+                    img(ImageSource::Render(decoded.image.clone()))
+                        .w(px(decoded.width))
+                        .h(px(decoded.height))
+                        .max_w_full()
+                        .max_h_full()
+                        .flex_shrink()
+                        .min_h_0()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(format!(
+                            "{} × {}",
+                            decoded.width.round(),
+                            decoded.height.round()
+                        )),
+                ),
+            Some(ImageState::Failed(error)) => {
+                empty_state("Image preview unavailable", error.clone(), false)
+            }
+            _ => empty_state("Loading image…", "", false),
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .p_6()
+            .child(content)
     }
 
     fn publish_selection(&mut self, window: &Window) {
@@ -2569,24 +3518,17 @@ impl Give {
         );
     }
 
-    fn branch_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn branch_picker(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.picker_rows();
-        let height = (rows.len().clamp(1, 11) as f32) * 30.;
-        div()
-            .id("branch-picker-backdrop")
-            .absolute()
-            .inset_0()
-            .flex()
-            .justify_center()
-            .pt(px(88.))
-            .bg(hsla(0., 0., 0., 0.35))
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.close_picker(window, cx)),
-            )
-            .child(
-                div()
+        let reserved = if self.picker_note.is_some() {
+            330.
+        } else {
+            210.
+        };
+        let max_height = (f32::from(window.viewport_size().height) - reserved).max(60.);
+        let height = ((rows.len().clamp(1, 11) as f32) * 30.).min(max_height);
+        let switching = self.picker_mode == BranchPickerMode::Switch;
+        let panel = div()
                     .key_context("BranchPicker")
                     .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.move_picker(-1, cx)))
                     .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.move_picker(1, cx)))
@@ -2616,14 +3558,30 @@ impl Give {
                                 div()
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Review branch"),
+                                    .child(if switching { "Branches" } else { "Review branch" }),
                             )
                             .child(
                                 div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                                    "Fetches all remotes, then compares with the open GitLab MR or the merge-base with main.",
+                                    if switching { "Choose a local branch or check out a remote branch with tracking." } else { "Fetches all remotes, then compares with the open GitLab MR or the merge-base with main." },
                                 ),
                             ),
                     )
+                    .when(switching, |el| el.child(
+                        div().px_3().pb_2().flex().gap_2()
+                            .child(Button::new("fetch-branches").ghost().xsmall()
+                                .label("Fetch all remotes")
+                                .disabled(self.busy || self.branches_loading || self.review_step.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.branch_operation(BranchOperation::Fetch, window, cx)
+                                })))
+                            .child(Button::new("pull-branch").ghost().xsmall()
+                                .label("Pull current branch")
+                                .tooltip("Update the checked-out branch from its upstream · fast-forward only")
+                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.branch_operation(BranchOperation::Pull, window, cx)
+                                })))
+                    ))
                     .child(
                         div().px_3().pb_2().child(
                             Input::new(&self.branch_input)
@@ -2673,6 +3631,11 @@ impl Give {
                                 )
                             }),
                     )
+                    .when_some(self.picker_note.as_ref(), |el, note| {
+                        el.child(div().id("branch-operation-error").max_h(px(120.)).overflow_y_scroll()
+                            .px_4().py_2().text_size(px(11.)).text_color(rgb(RED))
+                            .child(note.chars().take(1800).collect::<String>()))
+                    })
                     .child(
                         div()
                             .h(px(28.))
@@ -2690,20 +3653,42 @@ impl Give {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .when(self.picker_note.is_some(), |el| {
-                                        el.text_color(rgb(RED))
-                                    })
-                                    .child(if let Some(note) = &self.picker_note {
-                                        note.clone()
+                                    .child(if self.busy {
+                                        self.notice.clone()
                                     } else if self.branches_loading {
-                                        "Fetching remotes…".to_owned()
+                                        "Loading branches…".to_owned()
                                     } else {
                                         format!("{} branches", self.branches.len())
                                     }),
                             )
-                            .child("↑↓ choose · Enter review · Esc close"),
-                    ),
+                            .child(if switching { "↑↓ choose · Enter switch · Esc close" } else { "↑↓ choose · Enter review · Esc close" }),
+                    );
+
+        let backdrop = div()
+            .id("branch-picker-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_picker(window, cx)),
+            );
+        if switching {
+            let bounds = self.branch_button_bounds.get();
+            backdrop.child(
+                anchored()
+                    .position(point(bounds.left(), bounds.bottom() + px(4.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(panel),
             )
+        } else {
+            backdrop
+                .flex()
+                .justify_center()
+                .pt(px(88.))
+                .bg(hsla(0., 0., 0., 0.35))
+                .child(panel)
+        }
     }
 
     fn picker_row(&self, index: usize, row: PickerRow, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -2725,6 +3710,9 @@ impl Give {
         };
         div()
             .id(index)
+            .when(self.busy || self.review_step.is_some(), |el| {
+                el.opacity(0.55)
+            })
             .h(px(30.))
             .px_4()
             .flex()
@@ -2798,6 +3786,40 @@ impl Give {
                         this.open_picker(&OpenRepository, window, cx)
                     })),
             )
+            .when(!self.recent.is_empty(), |el| {
+                el.child(
+                    div()
+                        .w(px(420.))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_1()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .child("Recent projects"),
+                        )
+                        .children(self.recent.iter().take(5).enumerate().map(|(ix, path)| {
+                            let target = path.clone();
+                            div()
+                                .id(("welcome-recent", ix))
+                                .px_3()
+                                .py_1p5()
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .hover(|el| el.bg(rgb(SURFACE)))
+                                .when(self.opening, |el| el.opacity(0.5))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if !this.opening {
+                                        this.open(target.clone(), window, cx);
+                                    }
+                                }))
+                                .child(recent_project_label(path))
+                        })),
+                )
+            })
             .child(
                 div()
                     .mt_3()
@@ -2828,6 +3850,7 @@ impl Render for Give {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
                     this.terminal_dragging = false;
+                    this.sidebar_dragging = false;
                     this.preview_selecting = false;
                 }),
             )
@@ -2835,10 +3858,13 @@ impl Render for Give {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
                     this.terminal_dragging = false;
+                    this.sidebar_dragging = false;
                     this.preview_selecting = false;
                 }),
             )
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::close_preview))
             .on_action(
                 cx.listener(|this, _: &Refresh, window, cx| this.manual_refresh(window, cx)),
             )
@@ -2890,7 +3916,10 @@ impl Render for Give {
                     .min_h_0()
                     .overflow_hidden()
                     .when(self.repo.is_some(), |el| {
-                        el.child(self.sidebar(cx)).child(self.preview(cx))
+                        el.when(self.sidebar_visible, |el| el.child(self.sidebar(cx)))
+                            .when(self.selected.is_some() || !self.terminal_visible, |el| {
+                                el.child(self.preview(window, cx))
+                            })
                     })
                     .when(self.repo.is_none(), |el| el.child(self.welcome(cx)))
                     .when(self.terminal_visible, |el| {
@@ -2921,7 +3950,19 @@ impl Render for Give {
                         "Tab focus · ↑↓ / J K move · D deletions · Space / Ctrl+N next change · ⌘⇧R review branch",
                     ),
             )
-            .when(self.picker_open, |el| el.child(self.branch_picker(cx)))
+            .when(self.picker_open, |el| el.child(self.branch_picker(window, cx)))
+    }
+}
+
+/// A new right-click starts without the previous row's "Copy path".
+fn clear_context_copy(
+    this: &mut Give,
+    event: &MouseDownEvent,
+    _: &mut Window,
+    _: &mut Context<Give>,
+) {
+    if event.button == MouseButton::Right {
+        this.context_copy = None;
     }
 }
 
@@ -2937,9 +3978,12 @@ fn load_slot(
     }
 }
 
-/// Untracked (not yet added to Git) is red, deleted grey, newly added green, otherwise modified blue.
+/// Untracked (not yet added to Git) is red, deleted grey, newly added green, otherwise
+/// modified blue. Unchanged catalog files keep the plain text color.
 fn file_name_color(file: &ChangedFile) -> u32 {
-    if file.untracked() || file.conflicted() {
+    if file.clean() {
+        TEXT
+    } else if file.untracked() || file.conflicted() {
         NAME_UNTRACKED
     } else if file.index == 'D' || file.worktree == 'D' {
         NAME_DELETED
@@ -2980,6 +4024,40 @@ fn empty_state(title: impl Into<SharedString>, detail: impl Into<SharedString>, 
                 .text_size(px(12.))
                 .text_color(rgb(MUTED))
                 .child(detail.into()),
+        )
+}
+
+/// A project name over its shortened path, for recent-project lists.
+fn recent_project_label(path: &std::path::Path) -> Div {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .min_w_0()
+        .child(ui_icon("folder", 14., MUTED))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(TEXT))
+                        .truncate()
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .truncate()
+                        .child(recent::display(path)),
+                ),
         )
 }
 

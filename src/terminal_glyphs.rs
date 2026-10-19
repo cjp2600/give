@@ -278,10 +278,16 @@ mod tests {
 
     #[test]
     fn blocks_fill_their_fraction_of_the_cell() {
-        assert_eq!(rects('█', 8., 16., 1.).unwrap(), vec![rect(0., 0., 8., 16.)]);
+        assert_eq!(
+            rects('█', 8., 16., 1.).unwrap(),
+            vec![rect(0., 0., 8., 16.)]
+        );
         assert_eq!(rects('▀', 8., 16., 1.).unwrap(), vec![rect(0., 0., 8., 8.)]);
         assert_eq!(rects('▄', 8., 16., 1.).unwrap(), vec![rect(0., 8., 8., 8.)]);
-        assert_eq!(rects('▏', 8., 16., 1.).unwrap(), vec![rect(0., 0., 1., 16.)]);
+        assert_eq!(
+            rects('▏', 8., 16., 1.).unwrap(),
+            vec![rect(0., 0., 1., 16.)]
+        );
         assert_eq!(rects('▒', 8., 16., 1.).unwrap()[0].alpha, 0.5);
         assert_eq!(rects('▟', 8., 16., 1.).unwrap().len(), 3);
         let dashed = rects('┄', 9., 16., 1.).unwrap();

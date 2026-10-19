@@ -1,0 +1,161 @@
+%YAML 1.2
+---
+# A compact Dart grammar for the preview. Syntect's bundled set has no Dart.
+# Scopes follow the bundled Java/JavaScript grammars so the palette matches.
+name: Dart
+file_extensions: [dart]
+scope: source.dart
+
+variables:
+  ident: '[A-Za-z_$][A-Za-z0-9_$]*'
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: annotations
+    - include: numbers
+    - include: keywords
+    - include: types
+    - include: functions
+
+  comments:
+    - match: '///.*$'
+      scope: comment.line.documentation.dart
+    - match: '//.*$'
+      scope: comment.line.double-slash.dart
+    - match: '/\*'
+      scope: punctuation.definition.comment.begin.dart
+      push: block_comment
+
+  block_comment:
+    - meta_scope: comment.block.dart
+    - match: '/\*'
+      push: block_comment
+    - match: '\*/'
+      scope: punctuation.definition.comment.end.dart
+      pop: true
+
+  annotations:
+    - match: '@{{ident}}(?:\.{{ident}})*'
+      scope: variable.annotation.dart
+
+  numbers:
+    - match: '\b0[xX][0-9A-Fa-f_]+\b'
+      scope: constant.numeric.hex.dart
+    - match: '(?:\b\d[\d_]*(?:\.\d[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d+)?\b'
+      scope: constant.numeric.dart
+
+  keywords:
+    - match: '\b(?:if|else|for|while|do|switch|case|default|break|continue|return|yield|await|try|catch|finally|throw|rethrow|assert|in|is|as|on|when)\b'
+      scope: keyword.control.dart
+    - match: '\b(?:import|export|library|part|of|show|hide|deferred)\b'
+      scope: keyword.other.import.dart
+    - match: '\b(?:class|enum|mixin|typedef|extension|type)\b(?=\s+[A-Za-z_$])'
+      scope: storage.type.class.dart
+    - match: '\b(?:abstract|base|sealed|interface|final|const|var|late|static|external|factory|get|set|operator|covariant|required|extends|implements|with|async|sync|new)\b'
+      scope: storage.modifier.dart
+    - match: '\b(?:true|false|null)\b'
+      scope: constant.language.dart
+    - match: '\b(?:this|super)\b'
+      scope: variable.language.dart
+    - match: '\b(?:void|dynamic|int|double|num|bool)\b'
+      scope: storage.type.primitive.dart
+
+  types:
+    - match: '\b_?[A-Z][A-Z0-9_]+\b'
+      scope: constant.other.dart
+    - match: '\b_?[A-Z][A-Za-z0-9_$]*\b'
+      scope: support.class.dart
+
+  functions:
+    - match: '\b{{ident}}(?=\s*(?:<[^()]*>)?\()'
+      scope: entity.name.function.dart
+
+  strings:
+    - match: "\\br'''"
+      push: raw_triple_single
+    - match: '\br"""'
+      push: raw_triple_double
+    - match: "\\br'"
+      push: raw_single
+    - match: '\br"'
+      push: raw_double
+    - match: "'''"
+      push: triple_single
+    - match: '"""'
+      push: triple_double
+    - match: "'"
+      push: single
+    - match: '"'
+      push: double
+
+  raw_triple_single:
+    - meta_scope: string.quoted.triple.raw.dart
+    - match: "'''"
+      pop: true
+
+  raw_triple_double:
+    - meta_scope: string.quoted.triple.raw.dart
+    - match: '"""'
+      pop: true
+
+  raw_single:
+    - meta_scope: string.quoted.single.raw.dart
+    - match: "'"
+      pop: true
+
+  raw_double:
+    - meta_scope: string.quoted.double.raw.dart
+    - match: '"'
+      pop: true
+
+  triple_single:
+    - meta_scope: string.quoted.triple.dart
+    - match: "'''"
+      pop: true
+    - include: string_content
+
+  triple_double:
+    - meta_scope: string.quoted.triple.dart
+    - match: '"""'
+      pop: true
+    - include: string_content
+
+  single:
+    - meta_scope: string.quoted.single.dart
+    - match: "'"
+      pop: true
+    - include: string_content
+
+  double:
+    - meta_scope: string.quoted.double.dart
+    - match: '"'
+      pop: true
+    - include: string_content
+
+  string_content:
+    - match: '\\.'
+      scope: constant.character.escape.dart
+    - match: '\$\{'
+      scope: punctuation.section.interpolation.begin.dart
+      push: interpolation
+    - match: '\${{ident}}'
+      scope: variable.other.interpolated.dart
+
+  interpolation:
+    - clear_scopes: 1
+    - meta_scope: meta.interpolation.dart
+    - match: '\}'
+      scope: punctuation.section.interpolation.end.dart
+      pop: true
+    - match: '\{'
+      push: braces
+    - include: main
+
+  braces:
+    - match: '\}'
+      pop: true
+    - match: '\{'
+      push: braces
+    - include: main

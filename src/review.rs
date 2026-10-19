@@ -20,6 +20,8 @@ const MAIN_CANDIDATES: [&str; 4] = ["origin/main", "origin/master", "main", "mas
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Branch {
+    /// Full ref, unaffected by ambiguous short names or tags.
+    pub reference: String,
     /// The name Git resolves: `feature` or `origin/feature`.
     pub name: String,
     /// Remote of a remote-tracking branch.
@@ -67,7 +69,7 @@ pub fn branches(repo: &Repository) -> Result<Vec<Branch>> {
         [
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(HEAD)%00%(refname)%00%(refname:short)%00%(symref)",
+            "--format=%(HEAD)%00%(refname)%00%(symref)",
             "refs/heads",
             "refs/remotes",
         ],
@@ -80,7 +82,6 @@ pub fn branches(repo: &Repository) -> Result<Vec<Branch>> {
             let mut fields = line.split('\0');
             let head = fields.next()?;
             let full = fields.next()?;
-            let name = fields.next()?;
             // `origin/HEAD` points at another branch.
             if !fields.next().unwrap_or_default().is_empty() {
                 return None;
@@ -99,7 +100,11 @@ pub fn branches(repo: &Repository) -> Result<Vec<Branch>> {
                 None => None,
             };
             Some(Branch {
-                name: name.to_owned(),
+                reference: full.to_owned(),
+                name: full
+                    .strip_prefix("refs/heads/")
+                    .or_else(|| full.strip_prefix("refs/remotes/"))?
+                    .to_owned(),
                 remote,
                 current: head == "*",
             })
@@ -266,8 +271,14 @@ impl Review {
         Snapshot {
             branch: self.branch.clone(),
             files: self.files.clone(),
+            catalog: Vec::new(),
             versions,
         }
+    }
+
+    /// The file's bytes at the reviewed head.
+    pub fn head_blob(&self, repo: &Repository, path: &Path) -> Result<Vec<u8>> {
+        blob(repo, &self.head, path)
     }
 
     /// giv's `BuildReviewPreview`: both modes from one diff and one blob read.

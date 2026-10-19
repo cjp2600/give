@@ -1,4 +1,5 @@
 mod accessibility;
+mod image_view;
 mod terminal_view;
 mod ui;
 
@@ -20,6 +21,9 @@ impl AssetSource for Assets {
             "icons/panel-right.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/ui/panel-right.svg"
             ))),
+            "icons/panel-left.svg" => {
+                Some(Cow::Borrowed(include_bytes!("../assets/ui/panel-left.svg")))
+            }
             "icons/file.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/file.svg"))),
             "icons/code.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/code.svg"))),
             "icons/branch.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/branch.svg"))),
@@ -44,6 +48,7 @@ impl AssetSource for Assets {
             "icons/folder-open.svg",
             "icons/file.svg",
             "icons/panel-right.svg",
+            "icons/panel-left.svg",
             "icons/code.svg",
             "icons/branch.svg",
             "icons/chevron-right.svg",
@@ -79,7 +84,9 @@ actions!(
         FirstRow,
         LastRow,
         CopyDiff,
+        ClosePreview,
         ToggleTerminal,
+        ToggleSidebar,
         CopySelection,
         SelectAllText,
         SelectLeft,
@@ -93,6 +100,33 @@ actions!(
         PickerCancel
     ]
 );
+
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = give, no_json)]
+pub struct OpenRecentProject {
+    path: PathBuf,
+}
+
+fn update_dock_menu(projects: &[PathBuf], cx: &App) {
+    #[cfg(not(target_os = "macos"))]
+    let _ = (projects, cx);
+    #[cfg(target_os = "macos")]
+    cx.set_dock_menu(
+        projects
+            .iter()
+            .map(|path| {
+                MenuItem::action(
+                    format!(
+                        "{} — {}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        give::recent::display(path)
+                    ),
+                    OpenRecentProject { path: path.clone() },
+                )
+            })
+            .collect(),
+    );
+}
 
 fn main() {
     let mut initial = None;
@@ -137,7 +171,9 @@ fn main() {
             theme.colors.secondary_hover = rgb(0x2e425a).into();
             theme.colors.secondary_active = rgb(0x354d67).into();
             theme.colors.secondary_foreground = rgb(0xcbd5e1).into();
-            theme.colors.selection = rgb(0x304b67).into();
+            // TextView paints selection over glyphs, so it must be translucent;
+            // over the background this blends to about 0x304b67.
+            theme.colors.selection = rgba(0x5a8fc85a).into();
             theme.colors.title_bar = rgb(0x151e28).into();
             theme.colors.title_bar_border = rgb(0x263445).into();
             theme.colors.primary = rgb(0x83afd5).into();
@@ -173,7 +209,14 @@ fn main() {
                     SelectDown,
                     Some("Give && !Input && !Terminal"),
                 ),
+                KeyBinding::new("secondary-2", ToggleTerminal, Some("Give")),
                 KeyBinding::new("secondary-b", ToggleTerminal, Some("Give")),
+                KeyBinding::new("secondary-1", ToggleSidebar, Some("Give")),
+                KeyBinding::new(
+                    "secondary-w",
+                    ClosePreview,
+                    Some("Give && !Input && !Terminal"),
+                ),
                 KeyBinding::new("secondary-q", Quit, None),
                 KeyBinding::new("secondary-o", OpenRepository, Some("Give")),
                 KeyBinding::new("secondary-r", Refresh, Some("Give && !Terminal")),
@@ -213,11 +256,15 @@ fn main() {
                     items: vec![
                         MenuItem::action("Open Repository…", OpenRepository),
                         MenuItem::action("Refresh", Refresh),
+                        MenuItem::action("Close Preview", ClosePreview),
                     ],
                 },
                 Menu {
                     name: "View".into(),
-                    items: vec![MenuItem::action("Toggle Right Terminal", ToggleTerminal)],
+                    items: vec![
+                        MenuItem::action("Toggle Left Sidebar", ToggleSidebar),
+                        MenuItem::action("Toggle Right Terminal", ToggleTerminal),
+                    ],
                 },
                 Menu {
                     name: "Changes".into(),
@@ -248,6 +295,23 @@ fn main() {
                 |window, cx| {
                     let view =
                         cx.new(|cx| ui::Give::new(initial.clone(), review.clone(), window, cx));
+                    let project_view = view.downgrade();
+                    let project_window = window.window_handle();
+                    cx.on_action(move |action: &OpenRecentProject, cx| {
+                        let view = project_view.clone();
+                        let path = action.path.clone();
+                        // Menu actions can arrive while GPUI is dispatching into this
+                        // window. Re-enter it only after that dispatch has finished.
+                        cx.defer(move |cx| {
+                            let _ = project_window.update(cx, |_, window, cx| {
+                                let _ = view.update(cx, |view, cx| {
+                                    cx.activate(true);
+                                    window.activate_window();
+                                    view.open(path, window, cx);
+                                });
+                            });
+                        });
+                    });
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             );

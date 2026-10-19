@@ -1,4 +1,5 @@
 //! The giv file trie: tracked/untracked sections, directories first, compact paths.
+//! The catalog variant shows every project file in one tree.
 use crate::git::ChangedFile;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -19,6 +20,8 @@ pub struct TreeRow {
     pub label: String,
     pub depth: usize,
     pub untracked: bool,
+    /// The row is a changed file or a directory containing one.
+    pub changed: bool,
 }
 
 impl TreeRow {
@@ -39,6 +42,7 @@ impl TreeRow {
 struct Node {
     children: BTreeMap<std::ffi::OsString, Node>,
     file: Option<ChangedFile>,
+    changed: bool,
 }
 
 impl Node {
@@ -46,23 +50,39 @@ impl Node {
         self.file.is_some() && self.children.is_empty()
     }
 
+    fn insert(&mut self, file: &ChangedFile) {
+        let changed = !file.clean();
+        let mut node = self;
+        node.changed |= changed;
+        for component in file.path.components() {
+            node = node
+                .children
+                .entry(component.as_os_str().into())
+                .or_default();
+            node.changed |= changed;
+        }
+        node.file = Some(file.clone());
+    }
+
     fn append(
         &self,
         parent: &Path,
         depth: usize,
         untracked: bool,
-        collapsed: &HashSet<PathBuf>,
+        expanded: &dyn Fn(&Path) -> bool,
         rows: &mut Vec<TreeRow>,
     ) {
         let mut children: Vec<_> = self.children.iter().collect();
         children.sort_by(|(a, x), (b, y)| x.leaf().cmp(&y.leaf()).then(a.cmp(b)));
         for (name, node) in children {
             if node.leaf() {
+                let file = node.file.clone().unwrap();
                 rows.push(TreeRow {
-                    kind: RowKind::File(node.file.clone().unwrap()),
+                    untracked: untracked || file.untracked(),
+                    changed: node.changed,
+                    kind: RowKind::File(file),
                     label: name.to_string_lossy().into_owned(),
                     depth,
-                    untracked,
                 });
                 continue;
             }
@@ -80,18 +100,19 @@ impl Node {
                 label.push_str(&name.to_string_lossy());
                 tip = child;
             }
-            let expanded = !collapsed.contains(&path);
+            let open = expanded(&path);
             rows.push(TreeRow {
                 kind: RowKind::Directory {
                     path: path.clone(),
-                    expanded,
+                    expanded: open,
                 },
                 label,
                 depth,
                 untracked,
+                changed: node.changed,
             });
-            if expanded {
-                tip.append(&path, depth + 1, untracked, collapsed, rows);
+            if open {
+                tip.append(&path, depth + 1, untracked, expanded, rows);
             }
         }
     }
@@ -103,14 +124,7 @@ pub fn build_tree(files: &[ChangedFile], collapsed: &HashSet<PathBuf>) -> Vec<Tr
         let mut root = Node::default();
         let mut count = 0;
         for file in files.iter().filter(|f| f.untracked() == untracked) {
-            let mut node = &mut root;
-            for component in file.path.components() {
-                node = node
-                    .children
-                    .entry(component.as_os_str().into())
-                    .or_default();
-            }
-            node.file = Some(file.clone());
+            root.insert(file);
             count += 1;
         }
         if count == 0 {
@@ -122,6 +136,7 @@ pub fn build_tree(files: &[ChangedFile], collapsed: &HashSet<PathBuf>) -> Vec<Tr
                 label: String::new(),
                 depth: 0,
                 untracked,
+                changed: false,
             });
         }
         rows.push(TreeRow {
@@ -129,10 +144,50 @@ pub fn build_tree(files: &[ChangedFile], collapsed: &HashSet<PathBuf>) -> Vec<Tr
             label: if untracked { "UNTRACKED" } else { "TRACKED" }.into(),
             depth: 0,
             untracked,
+            changed: false,
         });
-        root.append(Path::new(""), 0, untracked, collapsed, &mut rows);
+        root.append(
+            Path::new(""),
+            0,
+            untracked,
+            &|path| !collapsed.contains(path),
+            &mut rows,
+        );
     }
     rows
+}
+
+/// All project files as one directory tree, without sections. Directories open only
+/// when listed in `expanded`, or all of them with `expand_all` (while filtering).
+pub fn build_catalog(
+    files: &[ChangedFile],
+    expanded: &HashSet<PathBuf>,
+    expand_all: bool,
+) -> Vec<TreeRow> {
+    let mut root = Node::default();
+    for file in files {
+        root.insert(file);
+    }
+    let mut rows = Vec::new();
+    root.append(
+        Path::new(""),
+        0,
+        false,
+        &|path| expand_all || expanded.contains(path),
+        &mut rows,
+    );
+    rows
+}
+
+/// The directories holding changed files, used to open the catalog on its changes.
+pub fn changed_directories(files: &[ChangedFile]) -> HashSet<PathBuf> {
+    files
+        .iter()
+        .filter(|file| !file.clean())
+        .flat_map(|file| file.path.ancestors().skip(1))
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 pub fn prune_collapsed(collapsed: &mut HashSet<PathBuf>, files: &[ChangedFile]) {

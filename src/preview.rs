@@ -1,7 +1,11 @@
 //! Full-file overlay ported from giv's tui/diffview.go and tui/preview.go.
 use crate::git::{Diff, DiffLine, LineKind};
 use std::{ops::Range, path::Path, sync::LazyLock};
-use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::ThemeSet,
+    parsing::{SyntaxDefinition, SyntaxSet, SyntaxSetBuilder},
+};
 
 pub const MAX_LINES: usize = 6000;
 
@@ -12,10 +16,25 @@ pub struct Highlight {
 }
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_nonewlines);
+/// Grammars missing from Syntect's bundled set, kept separate so the bundled
+/// dump loads without relinking.
+static EXTRA_SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(|| {
+    let mut builder = SyntaxSetBuilder::new();
+    builder.add(
+        SyntaxDefinition::load_from_str(
+            include_str!("../assets/syntaxes/Dart.sublime-syntax"),
+            false,
+            None,
+        )
+        .expect("bundled Dart grammar"),
+    );
+    builder.build()
+});
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 pub fn warm_up() {
     LazyLock::force(&SYNTAXES);
+    LazyLock::force(&EXTRA_SYNTAXES);
     LazyLock::force(&THEMES);
 }
 
@@ -24,17 +43,21 @@ pub fn warm_up() {
 pub fn highlight(path: &Path, lines: &[DiffLine]) -> Vec<Vec<Highlight>> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let extension = path.extension().unwrap_or_default().to_string_lossy();
-    let syntax = SYNTAXES
-        .find_syntax_by_extension(&name)
-        .or_else(|| SYNTAXES.find_syntax_by_extension(&extension))
-        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
+    let find = |set: &'static SyntaxSet| {
+        set.find_syntax_by_extension(&name)
+            .or_else(|| set.find_syntax_by_extension(&extension))
+            .map(|syntax| (syntax, set))
+    };
+    let (syntax, set) = find(&SYNTAXES)
+        .or_else(|| find(&EXTRA_SYNTAXES))
+        .unwrap_or_else(|| (SYNTAXES.find_syntax_plain_text(), &SYNTAXES));
     lines
         .iter()
         .map(|line| {
             let mut highlighter = HighlightLines::new(syntax, &THEMES.themes["base16-ocean.dark"]);
             let mut offset = 0;
             highlighter
-                .highlight_line(&line.text, &SYNTAXES)
+                .highlight_line(&line.text, set)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(style, text)| {

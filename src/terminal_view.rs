@@ -19,8 +19,9 @@ use std::{
 const FONT_SIZE: f32 = 14.;
 /// About Menlo's own line height, so glyphs drawn by the font nearly touch.
 const ROW_HEIGHT: f32 = 17.;
-/// The grid keeps this width at any panel size; a narrower panel scrolls horizontally.
-const COLUMNS: u16 = 100;
+/// The grid is never narrower than this; a narrower panel scrolls horizontally,
+/// a wider one gets as many columns as fit.
+const MIN_COLUMNS: u16 = 100;
 actions!(terminal, [TerminalCopy, TerminalPaste, TerminalSelectAll]);
 
 pub fn init(cx: &mut App) {
@@ -48,6 +49,8 @@ pub struct TerminalView {
     cell_width: f32,
     /// Horizontal offset of the grid inside a panel narrower than it, in pixels.
     scroll_x: f32,
+    /// When `scroll_x` last moved; the horizontal bar shows only shortly after.
+    scrolled_at: Option<Instant>,
     /// The cursor last brought into view; scrolling follows only its moves.
     followed_cursor: Option<(usize, usize)>,
     size: Size,
@@ -92,10 +95,11 @@ impl TerminalView {
             bounds: Rc::new(Cell::new(Bounds::default())),
             cell_width: 8.4,
             scroll_x: 0.,
+            scrolled_at: None,
             followed_cursor: None,
             size: Size {
                 rows: 32,
-                cols: COLUMNS,
+                cols: MIN_COLUMNS,
                 pixel_width: 1008,
                 pixel_height: 672,
             },
@@ -536,6 +540,7 @@ impl TerminalView {
         if delta.x.abs() > delta.y.abs() {
             // Clamped against the panel width when the grid is next painted.
             self.scroll_x = (self.scroll_x - f32::from(delta.x)).max(0.);
+            self.scrolled_at = Some(Instant::now());
             cx.notify();
             cx.stop_propagation();
             return;
@@ -684,14 +689,16 @@ impl Render for TerminalView {
                                             None,
                                         );
                                         this.cell_width = f32::from(line.width).max(1.);
-                                        let grid_width = COLUMNS as f32 * this.cell_width;
                                         let view_width = f32::from(bounds.size.width);
+                                        let cols = ((view_width / this.cell_width).floor() as u16)
+                                            .max(MIN_COLUMNS);
+                                        let grid_width = cols as f32 * this.cell_width;
                                         let size = Size {
                                             rows: (f32::from(bounds.size.height) / ROW_HEIGHT)
                                                 .floor()
                                                 .max(1.)
                                                 as u16,
-                                            cols: COLUMNS,
+                                            cols,
                                             pixel_width: grid_width as u16,
                                             pixel_height: f32::from(bounds.size.height).max(1.)
                                                 as u16,
@@ -702,10 +709,14 @@ impl Render for TerminalView {
                                                 terminal.resize(size);
                                             }
                                         }
+                                        let previous = this.scroll_x;
                                         this.follow_cursor(view_width);
                                         this.scroll_x = this
                                             .scroll_x
                                             .clamp(0., (grid_width - view_width).max(0.));
+                                        if this.scroll_x != previous {
+                                            this.scrolled_at = Some(Instant::now());
+                                        }
                                         (
                                             this.frame.clone(),
                                             this.focus.is_focused(window),
@@ -714,6 +725,8 @@ impl Render for TerminalView {
                                             this.cell_width,
                                             this.error.clone(),
                                             this.scroll_x,
+                                            grid_width,
+                                            this.scrolled_at,
                                         )
                                     })
                                 },
@@ -726,6 +739,8 @@ impl Render for TerminalView {
                                     cell_width,
                                     error,
                                     scroll_x,
+                                    grid_width,
+                                    scrolled_at,
                                 ),
                                       window,
                                       cx| {
@@ -743,7 +758,7 @@ impl Render for TerminalView {
                                     };
                                     let grid = Bounds::new(
                                         point(bounds.left() - px(scroll_x), bounds.top()),
-                                        size(px(COLUMNS as f32 * cell_width), bounds.size.height),
+                                        size(px(grid_width), bounds.size.height),
                                     );
                                     paint_frame(
                                         &frame,
@@ -754,7 +769,7 @@ impl Render for TerminalView {
                                         window,
                                         cx,
                                     );
-                                    paint_scrollbar(bounds, grid, window);
+                                    paint_scrollbar(bounds, grid, scrolled_at, window);
                                 },
                             )
                             .size_full(),
@@ -787,12 +802,27 @@ impl Render for TerminalView {
     }
 }
 
-/// A thin position bar under the grid while it is wider than the panel.
-fn paint_scrollbar(view: Bounds<Pixels>, grid: Bounds<Pixels>, window: &mut Window) {
+/// The bar stays this long after the last horizontal scroll, then fades out.
+const SCROLLBAR_HOLD: Duration = Duration::from_millis(800);
+const SCROLLBAR_FADE: Duration = Duration::from_millis(300);
+
+/// A thin position bar under a grid wider than the panel, shown while it scrolls.
+fn paint_scrollbar(
+    view: Bounds<Pixels>,
+    grid: Bounds<Pixels>,
+    scrolled_at: Option<Instant>,
+    window: &mut Window,
+) {
     let (view_width, grid_width) = (f32::from(view.size.width), f32::from(grid.size.width));
-    if grid_width <= view_width + 0.5 {
+    let Some(elapsed) = scrolled_at.map(|at| at.elapsed()) else {
+        return;
+    };
+    if grid_width <= view_width + 0.5 || elapsed >= SCROLLBAR_HOLD + SCROLLBAR_FADE {
         return;
     }
+    let opacity =
+        1. - elapsed.saturating_sub(SCROLLBAR_HOLD).as_secs_f32() / SCROLLBAR_FADE.as_secs_f32();
+    window.request_animation_frame();
     let offset = f32::from(view.left() - grid.left());
     let thumb = Bounds::new(
         point(
@@ -801,7 +831,10 @@ fn paint_scrollbar(view: Bounds<Pixels>, grid: Bounds<Pixels>, window: &mut Wind
         ),
         size(px(view_width * view_width / grid_width), px(3.)),
     );
-    window.paint_quad(fill(thumb, rgba(0x7a8da580)));
+    window.paint_quad(fill(
+        thumb,
+        Hsla::from(rgb(0x7a8da5)).opacity(0.5 * opacity),
+    ));
 }
 
 fn paint_message(text: &str, origin: Point<Pixels>, window: &mut Window, cx: &mut App) {

@@ -37,6 +37,11 @@ impl ChangedFile {
         self.index == '?'
     }
 
+    /// A catalog file without any change.
+    pub fn clean(&self) -> bool {
+        self.index == ' ' && self.worktree == ' '
+    }
+
     pub fn conflicted(&self) -> bool {
         matches!(
             (self.index, self.worktree),
@@ -59,7 +64,22 @@ impl ChangedFile {
 pub struct Snapshot {
     pub branch: String,
     pub files: Vec<ChangedFile>,
+    /// Every non-ignored project file, sorted by path, with changed files as in
+    /// `files` and clean ones as `'  '`. Empty unless requested.
+    pub catalog: Vec<ChangedFile>,
     pub versions: HashMap<PathBuf, u64>,
+}
+
+impl Snapshot {
+    /// A changed file, or a clean catalog file.
+    pub fn file(&self, path: &Path) -> Option<&ChangedFile> {
+        self.files.iter().find(|file| file.path == path).or_else(|| {
+            self.catalog
+                .binary_search_by(|file| file.path.as_path().cmp(path))
+                .ok()
+                .map(|i| &self.catalog[i])
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +135,11 @@ impl Repository {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_with(false)
+    }
+
+    /// With `catalog`, also lists every tracked and untracked, non-ignored file.
+    pub fn snapshot_with(&self, catalog: bool) -> Result<Snapshot> {
         let raw = run(
             &self.root,
             ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -134,12 +159,30 @@ impl Repository {
             }
         };
         let files = parse_status(&raw)?;
+        let catalog = if catalog {
+            let listed = run(
+                &self.root,
+                [
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+                None,
+                false,
+            )?;
+            merge_catalog(&files, &listed)?
+        } else {
+            Vec::new()
+        };
         let head =
             run(&self.root, ["rev-parse", "--verify", "HEAD"], None, false).unwrap_or_default();
         // A porcelain status can stay " M" while the file changes repeatedly.
         // Per-file versions invalidate only that file, also when HEAD changes.
         let versions = files
             .iter()
+            .chain(catalog.iter().filter(|file| file.clean()))
             .map(|file| {
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 head.hash(&mut hash);
@@ -155,6 +198,7 @@ impl Repository {
         Ok(Snapshot {
             branch,
             files,
+            catalog,
             versions,
         })
     }
@@ -415,6 +459,27 @@ pub fn parse_status(raw: &[u8]) -> Result<Vec<ChangedFile>> {
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// Joins NUL-delimited `git ls-files` paths with the changed files: changed files keep
+/// their status, every other path is clean. Staged deletions stay listed.
+pub fn merge_catalog(files: &[ChangedFile], listed: &[u8]) -> Result<Vec<ChangedFile>> {
+    let mut catalog: HashMap<PathBuf, ChangedFile> = files
+        .iter()
+        .map(|file| (file.path.clone(), file.clone()))
+        .collect();
+    for record in listed.split(|b| *b == 0).filter(|record| !record.is_empty()) {
+        let path = path_from_bytes(record)?;
+        catalog.entry(path.clone()).or_insert(ChangedFile {
+            path,
+            original_path: None,
+            index: ' ',
+            worktree: ' ',
+        });
+    }
+    let mut catalog: Vec<_> = catalog.into_values().collect();
+    catalog.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(catalog)
 }
 
 pub fn parse_diff(raw: &str) -> Diff {
