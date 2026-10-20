@@ -1,4 +1,5 @@
 mod accessibility;
+mod find_view;
 mod image_view;
 mod terminal_view;
 mod ui;
@@ -87,7 +88,8 @@ actions!(
         ClosePreview,
         ToggleTerminal,
         ToggleSidebar,
-        CopySelection,
+        CopyPath,
+        Find,
         SelectAllText,
         SelectLeft,
         SelectRight,
@@ -159,6 +161,7 @@ fn main() {
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             terminal_view::init(cx);
+            find_view::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             let theme = Theme::global_mut(cx);
             theme.colors.background = rgb(0x1b2632).into();
@@ -183,11 +186,8 @@ fn main() {
             theme.colors.ring = rgb(0x83afd5).into();
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([
-                KeyBinding::new(
-                    "secondary-c",
-                    CopySelection,
-                    Some("Give && !Input && !Terminal"),
-                ),
+                KeyBinding::new("secondary-c", CopyPath, Some("Give && !Input && !Terminal")),
+                KeyBinding::new("secondary-f", Find, Some("Give && !Terminal")),
                 KeyBinding::new(
                     "secondary-a",
                     SelectAllText,

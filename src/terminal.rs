@@ -4,9 +4,14 @@
 use alacritty_terminal::{
     event::{Event, EventListener, WindowSize},
     grid::{Dimensions, Scroll},
-    index::{Column, Line, Point, Side},
+    index::{Column, Direction, Line, Point, Side},
     selection::{Selection, SelectionType},
-    term::{Config, Term, TermMode, cell::Flags, color::Colors},
+    term::{
+        Config, Term, TermMode,
+        cell::Flags,
+        color::Colors,
+        search::{RegexIter, RegexSearch},
+    },
     vte::ansi::{Color, CursorShape, Processor, Rgb},
 };
 use anyhow::{Context, Result};
@@ -27,6 +32,7 @@ pub const FOREGROUND: u32 = 0xcbd5e1;
 pub use alacritty_terminal::selection::SelectionType as SelectionKind;
 pub use alacritty_terminal::term::TermMode as Mode;
 pub use alacritty_terminal::term::cell::Flags as CellFlags;
+pub use alacritty_terminal::term::search::Match as SearchMatch;
 pub use alacritty_terminal::vte::ansi::CursorShape as CursorKind;
 pub use portable_pty::PtySize as Size;
 
@@ -103,6 +109,43 @@ impl EventListener for Events {
 struct State {
     term: Term<Events>,
     exited: Option<String>,
+    content_revision: u64,
+}
+
+/// Search owns only a shared model handle, so scanning history runs on a worker.
+#[derive(Clone)]
+pub struct SearchSource(Arc<Mutex<State>>);
+
+pub struct SearchResults {
+    pub matches: Vec<SearchMatch>,
+    pub revision: u64,
+}
+
+impl SearchSource {
+    pub fn search(&self, query: &crate::search::Query) -> SearchResults {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        SearchResults {
+            matches: search_matches(&state.term, query),
+            revision: state.content_revision,
+        }
+    }
+}
+
+fn search_matches(term: &Term<Events>, query: &crate::search::Query) -> Vec<SearchMatch> {
+    if query.text.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut regex) = RegexSearch::new(&query.pattern()) else {
+        return Vec::new();
+    };
+    RegexIter::new(
+        Point::new(term.topmost_line(), Column(0)),
+        Point::new(term.bottommost_line(), term.last_column()),
+        Direction::Right,
+        term,
+        &mut regex,
+    )
+    .collect()
 }
 
 #[derive(Clone)]
@@ -118,6 +161,7 @@ pub struct Cell {
 }
 #[derive(Clone)]
 pub struct Frame {
+    pub content_revision: u64,
     pub rows: usize,
     pub columns: usize,
     pub cells: Vec<Cell>,
@@ -197,6 +241,7 @@ impl Terminal {
                 },
             ),
             exited: None,
+            content_revision: 0,
         }));
         let revision = Arc::new(AtomicU64::new(1));
         let model = state.clone();
@@ -212,6 +257,7 @@ impl Terminal {
                         Ok(count) => {
                             let mut state = model.lock().unwrap_or_else(|e| e.into_inner());
                             processor.advance(&mut state.term, &bytes[..count]);
+                            state.content_revision += 1;
                             drop(state);
                             changed.fetch_add(1, Ordering::Release);
                         }
@@ -240,6 +286,7 @@ impl Terminal {
                         Io::Resize(size) => {
                             let mut state = model.lock().unwrap_or_else(|e| e.into_inner());
                             state.term.resize(GridSize::from(size));
+                            state.content_revision += 1;
                             drop(state);
                             if master.resize(size).is_err() {
                                 break;
@@ -274,6 +321,16 @@ impl Terminal {
 
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+    pub fn search_source(&self) -> SearchSource {
+        SearchSource(self.state.clone())
+    }
+
+    pub fn reveal_match(&self, matched: &SearchMatch) {
+        if let Ok(mut state) = self.state.try_lock() {
+            state.term.scroll_to_point(*matched.start());
+            self.revision.fetch_add(1, Ordering::Release);
+        }
     }
     pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
         self.events.try_iter()
@@ -419,6 +476,7 @@ fn frame(state: &State) -> Frame {
     // A complete line selection includes its final newline in Alacritty.
     text.push('\n');
     Frame {
+        content_revision: state.content_revision,
         text,
         selected_text,
         rows: term.screen_lines(),
@@ -630,11 +688,59 @@ mod tests {
                 size: Arc::new(AtomicU64::new(pack_size(size))),
             },
         );
-        (State { term, exited: None }, incoming, events)
+        (
+            State {
+                term,
+                exited: None,
+                content_revision: 0,
+            },
+            incoming,
+            events,
+        )
     }
     fn parse(state: &mut State, bytes: &[u8]) {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut state.term, bytes);
+    }
+    #[test]
+    fn search_finds_literal_text_across_wrapped_history_without_changing_selection() {
+        let (mut state, _, _) = model(2, 6);
+        parse(&mut state, b"xxxxNEEDLE\r\nlast\r\n");
+        let mut query = crate::search::Query {
+            text: "needle".into(),
+            case_sensitive: false,
+        };
+        let matches = search_matches(&state.term, &query);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].start().line.0 < 0);
+        assert_eq!(matches[0].start().column, Column(4));
+        assert_eq!(matches[0].end().column, Column(3));
+        assert!(state.term.selection.is_none());
+        state.term.scroll_to_point(*matches[0].start());
+        assert!(state.term.grid().display_offset() > 0);
+        query.case_sensitive = true;
+        assert!(search_matches(&state.term, &query).is_empty());
+    }
+
+    #[test]
+    fn search_handles_unicode_literal_punctuation_and_alternate_screen() {
+        let (mut state, _, _) = model(4, 30);
+        parse(&mut state, "🙂ПрИвЕт привет\r\na.b axb\r\n".as_bytes());
+        let mut query = crate::search::Query {
+            text: "привет".into(),
+            case_sensitive: false,
+        };
+        let matches = search_matches(&state.term, &query);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].start().column, Column(2));
+        query.text = "a.b".into();
+        assert_eq!(search_matches(&state.term, &query).len(), 1);
+        parse(&mut state, b"\x1b[?1049hother screen");
+        assert!(search_matches(&state.term, &query).is_empty());
+        parse(&mut state, b"\x1b[?1049l");
+        assert_eq!(search_matches(&state.term, &query).len(), 1);
+        query.text.clear();
+        assert!(search_matches(&state.term, &query).is_empty());
     }
     #[test]
     fn ansi_colors_unicode_hyperlinks_and_alternate_screen_round_trip() {

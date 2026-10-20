@@ -280,9 +280,21 @@ fn catalog_lists_every_file_in_one_tree_with_changes_kept() {
     )
     .unwrap();
     assert_eq!(catalog.len(), 6);
-    assert!(catalog.iter().any(|f| f.path == Path::new("gone.txt") && f.index == 'D'));
-    assert!(catalog.iter().any(|f| f.path == Path::new("Cargo.toml") && f.clean()));
-    assert!(catalog.iter().any(|f| f.path == Path::new("notes.md") && f.untracked()));
+    assert!(
+        catalog
+            .iter()
+            .any(|f| f.path == Path::new("gone.txt") && f.index == 'D')
+    );
+    assert!(
+        catalog
+            .iter()
+            .any(|f| f.path == Path::new("Cargo.toml") && f.clean())
+    );
+    assert!(
+        catalog
+            .iter()
+            .any(|f| f.path == Path::new("notes.md") && f.untracked())
+    );
 
     let rows = tree::build_catalog(&catalog, &HashSet::new(), false);
     assert_eq!(
@@ -297,7 +309,15 @@ fn catalog_lists_every_file_in_one_tree_with_changes_kept() {
     let rows = tree::build_catalog(&catalog, &expanded, false);
     assert_eq!(
         rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
-        ["src", "ui", "lib.rs", "new.rs", "Cargo.toml", "gone.txt", "notes.md"]
+        [
+            "src",
+            "ui",
+            "lib.rs",
+            "new.rs",
+            "Cargo.toml",
+            "gone.txt",
+            "notes.md"
+        ]
     );
     assert!(!rows[1].changed);
     let rows = tree::build_catalog(&catalog, &HashSet::new(), true);

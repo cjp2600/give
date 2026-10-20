@@ -2154,6 +2154,7 @@ dependencies = [
  "image",
  "portable-pty",
  "raw-window-handle",
+ "regex",
  "resvg",
  "serde_json",
  "syntect",

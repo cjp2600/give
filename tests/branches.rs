@@ -284,10 +284,27 @@ fn pull_keeps_dirty_files_and_does_not_autostash_even_when_configured() {
 }
 
 #[test]
+fn pull_without_upstream_finds_the_unique_same_named_remote_branch() {
+    let f = Fixture::new();
+    git(&f.repo.root, &["branch", "--unset-upstream"]);
+    commit(&f.publisher, "remote update\n");
+    git(&f.publisher, &["push", "--quiet", "origin", "main"]);
+    branches::pull(&f.repo).unwrap();
+    assert_eq!(f.head(), git(&f.publisher, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        git(
+            &f.repo.root,
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"]
+        ),
+        "refs/remotes/origin/main"
+    );
+}
+
+#[test]
 fn pull_reports_missing_upstream_detached_head_and_network_failures() {
     let f = Fixture::new();
     let before = f.head();
-    git(&f.repo.root, &["branch", "--unset-upstream"]);
+    git(&f.repo.root, &["switch", "-c", "unpublished"]);
     assert!(
         branches::pull(&f.repo)
             .unwrap_err()
@@ -302,4 +319,168 @@ fn pull_reports_missing_upstream_detached_head_and_network_failures() {
     assert!(review::fetch(&f.repo).is_err());
     assert!(branches::pull(&f.repo).is_err());
     assert_eq!(f.head(), before);
+}
+
+#[test]
+fn pull_requires_a_choice_for_multiple_remotes_and_remembers_explicit_choice() {
+    let f = Fixture::new();
+    git(
+        &f.repo.root,
+        &["remote", "add", "second", f.remote.to_str().unwrap()],
+    );
+    git(&f.repo.root, &["branch", "--unset-upstream"]);
+    let before = f.head();
+    let error = branches::pull(&f.repo).unwrap_err().to_string();
+    assert!(error.contains("Pull from"), "{error}");
+    assert_eq!(f.head(), before);
+    branches::pull_from(&f.repo, &f.branch("refs/remotes/second/feature/nested")).unwrap();
+    assert_eq!(
+        git(
+            &f.repo.root,
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"]
+        ),
+        "refs/remotes/second/feature/nested"
+    );
+    assert_eq!(f.repo.snapshot().unwrap().branch, "main");
+    assert_eq!(
+        fs::read_to_string(f.repo.root.join("file.txt")).unwrap(),
+        "feature\n"
+    );
+}
+
+#[test]
+fn failed_explicit_pull_preserves_upstream_and_local_history() {
+    let f = Fixture::new();
+    commit(&f.repo.root, "local divergence\n");
+    let before = f.head();
+    assert!(branches::pull_from(&f.repo, &f.branch("refs/remotes/origin/feature/nested")).is_err());
+    assert_eq!(f.head(), before);
+    assert_eq!(
+        git(
+            &f.repo.root,
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"]
+        ),
+        "refs/remotes/origin/main"
+    );
+    assert!(!f.repo.root.join(".git/MERGE_HEAD").exists());
+}
+
+#[test]
+fn push_publishes_new_branch_sets_tracking_and_can_publish_main_after_merge() {
+    let f = Fixture::new();
+    git(&f.repo.root, &["switch", "-c", "new-feature"]);
+    commit(&f.repo.root, "published feature\n");
+    let feature = f.branch("refs/heads/new-feature");
+    branches::push(&f.repo, "origin").unwrap();
+    assert_eq!(
+        git(&f.remote, &["rev-parse", "refs/heads/new-feature"]),
+        f.head()
+    );
+    assert_eq!(
+        git(
+            &f.repo.root,
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"]
+        ),
+        "refs/remotes/origin/new-feature"
+    );
+    branches::switch(&f.repo, &f.branch("refs/heads/main")).unwrap();
+    branches::merge(&f.repo, &feature).unwrap();
+    branches::push(&f.repo, "origin").unwrap();
+    assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/main"]), f.head());
+}
+
+#[test]
+fn push_rejection_preserves_remote_history_even_with_force_push_refspec_configured() {
+    let f = Fixture::new();
+    commit(&f.publisher, "remote advance\n");
+    git(&f.publisher, &["push", "--quiet", "origin", "main"]);
+    let remote_head = git(&f.remote, &["rev-parse", "main"]);
+    commit(&f.repo.root, "local divergence\n");
+    git(
+        &f.repo.root,
+        &["config", "remote.origin.push", "+refs/heads/*:refs/heads/*"],
+    );
+    assert!(branches::push(&f.repo, "origin").is_err());
+    assert_eq!(git(&f.remote, &["rev-parse", "main"]), remote_head);
+    assert!(branches::push(&f.repo, "missing").is_err());
+    git(&f.repo.root, &["switch", "--detach", "HEAD"]);
+    assert!(branches::push(&f.repo, "origin").is_err());
+}
+
+#[test]
+fn merge_creates_a_commit_for_clean_divergence_without_opening_an_editor() {
+    let f = Fixture::new();
+    git(&f.repo.root, &["switch", "-c", "topic"]);
+    fs::write(f.repo.root.join("topic.txt"), "topic\n").unwrap();
+    git(&f.repo.root, &["add", "topic.txt"]);
+    git(&f.repo.root, &["commit", "--quiet", "-m", "topic"]);
+    let branch = f.branch("refs/heads/topic");
+    let source = f.head();
+    branches::switch(&f.repo, &f.branch("refs/heads/main")).unwrap();
+    commit(&f.repo.root, "main advance\n");
+    let target = f.head();
+    git(&f.repo.root, &["config", "merge.ff", "only"]);
+    git(&f.repo.root, &["config", "merge.autoStash", "true"]);
+    branches::merge(&f.repo, &branch).unwrap();
+    assert_eq!(git(&f.repo.root, &["rev-parse", "HEAD^1"]), target);
+    assert_eq!(git(&f.repo.root, &["rev-parse", "HEAD^2"]), source);
+    assert!(f.repo.snapshot().unwrap().files.is_empty());
+    assert_eq!(git(&f.repo.root, &["stash", "list"]), "");
+}
+
+#[test]
+fn merge_reports_conflicting_files_and_abort_restores_target() {
+    let f = Fixture::new();
+    commit(&f.repo.root, "main change\n");
+    let before = f.head();
+    let error = branches::merge(&f.repo, &f.branch("refs/remotes/origin/feature/nested"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Merge conflict"), "{error}");
+    assert!(error.contains("file.txt"), "{error}");
+    assert!(error.contains("origin/feature/nested → main"), "{error}");
+    assert_eq!(f.head(), before);
+    assert!(
+        f.repo
+            .snapshot()
+            .unwrap()
+            .files
+            .iter()
+            .any(|file| file.conflicted())
+    );
+    assert!(f.repo.root.join(".git/MERGE_HEAD").exists());
+    branches::abort_merge(&f.repo).unwrap();
+    assert_eq!(f.head(), before);
+    assert!(f.repo.snapshot().unwrap().files.is_empty());
+    assert_eq!(
+        fs::read_to_string(f.repo.root.join("file.txt")).unwrap(),
+        "main change\n"
+    );
+}
+
+#[test]
+fn merge_requires_clean_worktree_and_uses_full_ref_despite_a_colliding_tag() {
+    let f = Fixture::new();
+    let branch = f.branch("refs/remotes/origin/feature/nested");
+    git(&f.repo.root, &["tag", "origin/feature/nested", "main"]);
+    fs::write(f.repo.root.join("untracked.txt"), "keep me\n").unwrap();
+    let before = f.head();
+    assert!(
+        branches::merge(&f.repo, &branch)
+            .unwrap_err()
+            .to_string()
+            .contains("Commit or stash")
+    );
+    assert_eq!(f.head(), before);
+    assert_eq!(
+        fs::read_to_string(f.repo.root.join("untracked.txt")).unwrap(),
+        "keep me\n"
+    );
+    fs::remove_file(f.repo.root.join("untracked.txt")).unwrap();
+    branches::merge(&f.repo, &branch).unwrap();
+    assert_eq!(
+        f.head(),
+        git(&f.repo.root, &["rev-parse", &branch.reference])
+    );
+    assert_eq!(f.repo.snapshot().unwrap().branch, "main");
 }

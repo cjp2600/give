@@ -1,6 +1,6 @@
 use crate::{
-    ActivateRow, ClosePreview, CollapseRow, Commit, CopyDiff, CopySelection, ExitReview, ExpandRow,
-    FirstRow, LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerCancel,
+    ActivateRow, ClosePreview, CollapseRow, Commit, CopyDiff, CopyPath, ExitReview, ExpandRow,
+    Find, FirstRow, LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerCancel,
     PickerDown, PickerUp, PreviousFile, Refresh, ReviewBranch, SelectAllText, SelectDown,
     SelectLeft, SelectRight, SelectUp, SwitchPane, ToggleDeletions, ToggleSidebar, ToggleTerminal,
 };
@@ -12,6 +12,7 @@ use give::{
     recent,
     review::{self, Branch, Review},
     scrollbar,
+    search::{self, SourceMatch},
     text_selection::{self, Point as TextPoint, Selection as TextSelection},
     tree::{self, RowKind, TreeRow},
 };
@@ -102,6 +103,11 @@ pub struct Give {
     show_deletions: bool,
     preview_cursor: usize,
     text_selection: Option<TextSelection>,
+    find: Entity<crate::find_view::FindPanel>,
+    find_matches: Arc<Vec<SourceMatch>>,
+    find_current: Option<usize>,
+    find_request: u64,
+    find_diff: Option<Arc<Diff>>,
     preview_selecting: bool,
     selection_pointer: Point<Pixels>,
     text_layouts: HashMap<usize, TextLayout>,
@@ -154,6 +160,7 @@ pub struct Give {
     picker_request: u64,
     picker_note: Option<String>,
     branches: Vec<Branch>,
+    branch_remotes: Vec<String>,
     branches_loading: bool,
     branch_input: Entity<InputState>,
     branch_query: String,
@@ -197,6 +204,7 @@ struct ContextCopy {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PickerRow {
     Branch(usize),
+    Remote(usize),
     Typed,
 }
 
@@ -204,12 +212,19 @@ enum PickerRow {
 enum BranchPickerMode {
     Review,
     Switch,
+    Merge,
+    PullFrom,
+    Push,
 }
 
 enum BranchOperation {
     Switch(Branch),
     Fetch,
     Pull,
+    PullFrom(Branch),
+    Push(String),
+    Merge(Branch),
+    AbortMerge,
 }
 
 impl Give {
@@ -224,7 +239,23 @@ impl Give {
             cx.new(|cx| InputState::new(window, cx).placeholder("Describe your changes…"));
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Branch name, local or remote…"));
+        let find = cx.new(|cx| crate::find_view::FindPanel::new(window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(&find, window, |this, _, event, window, cx| {
+                match event {
+                    crate::find_view::Event::Changed => this.search_preview(cx),
+                    crate::find_view::Event::Next => this.next_match(false, cx),
+                    crate::find_view::Event::Previous => this.next_match(true, cx),
+                    crate::find_view::Event::Closed => {
+                        this.find_request += 1;
+                        this.find_matches = Arc::default();
+                        this.find_diff = None;
+                        this.focus_left = false;
+                        this.focus.focus(window);
+                    }
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(&filter_input, window, |this, input, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.filter = input.read(cx).value().to_string().to_lowercase();
@@ -282,6 +313,11 @@ impl Give {
             show_deletions: false,
             preview_cursor: 0,
             text_selection: None,
+            find,
+            find_matches: Arc::default(),
+            find_current: None,
+            find_request: 0,
+            find_diff: None,
             preview_selecting: false,
             selection_pointer: point(px(0.), px(0.)),
             text_layouts: HashMap::new(),
@@ -326,6 +362,7 @@ impl Give {
             picker_request: 0,
             picker_note: None,
             branches: Vec::new(),
+            branch_remotes: Vec::new(),
             branches_loading: false,
             branch_input,
             branch_query: String::new(),
@@ -1553,6 +1590,7 @@ impl Give {
         self.picker_mode = mode;
         self.picker_note = None;
         self.branches.clear();
+        self.branch_remotes.clear();
         self.branch_query.clear();
         self.branch_cursor = 0;
         self.branch_scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -1566,7 +1604,7 @@ impl Give {
         // The review picker fetches automatically. Checkout exposes Fetch explicitly.
         cx.spawn(async move |view, cx| {
             for fetch in [false, true] {
-                if fetch && mode == BranchPickerMode::Switch {
+                if fetch && mode != BranchPickerMode::Review {
                     break;
                 }
                 let repo = repo.clone();
@@ -1578,7 +1616,7 @@ impl Give {
                         } else {
                             Ok(())
                         };
-                        (fetched, review::branches(&repo))
+                        (fetched, review::branches(&repo), branches::remotes(&repo))
                     })
                     .await;
                 let open = view
@@ -1586,7 +1624,11 @@ impl Give {
                         if request != this.picker_request || !this.picker_open {
                             return false;
                         }
-                        let (fetched, branches) = result;
+                        let (fetched, branches, remotes) = result;
+                        match remotes {
+                            Ok(remotes) => this.branch_remotes = remotes,
+                            Err(error) => this.picker_note = Some(format!("{error:#}")),
+                        }
                         if let Err(error) = fetched {
                             this.picker_note = Some(format!("Fetch failed: {error}"));
                         }
@@ -1594,7 +1636,7 @@ impl Give {
                             Ok(branches) => this.set_branches(branches),
                             Err(error) => this.picker_note = Some(format!("{error:#}")),
                         }
-                        if fetch || mode == BranchPickerMode::Switch {
+                        if fetch || mode != BranchPickerMode::Review {
                             this.branches_loading = false;
                         }
                         cx.notify();
@@ -1640,11 +1682,25 @@ impl Give {
     /// Branches matching the query, then the typed name when no branch has it exactly.
     fn picker_rows(&self) -> Vec<PickerRow> {
         let query = self.branch_query.to_lowercase();
+        if self.picker_mode == BranchPickerMode::Push {
+            return self
+                .branch_remotes
+                .iter()
+                .enumerate()
+                .filter(|(_, remote)| remote.to_lowercase().contains(&query))
+                .map(|(index, _)| PickerRow::Remote(index))
+                .collect();
+        }
         let mut rows: Vec<_> = self
             .branches
             .iter()
             .enumerate()
             .filter(|(_, branch)| branch.name.to_lowercase().contains(&query))
+            .filter(|(_, branch)| match self.picker_mode {
+                BranchPickerMode::Merge => !branch.current,
+                BranchPickerMode::PullFrom => branch.remote.is_some(),
+                _ => true,
+            })
             .map(|(index, _)| PickerRow::Branch(index))
             .collect();
         if self.picker_mode == BranchPickerMode::Review
@@ -1679,19 +1735,29 @@ impl Give {
         }
         let rows = self.picker_rows();
         let row = rows.get(self.branch_cursor.min(rows.len().saturating_sub(1)));
-        if self.picker_mode == BranchPickerMode::Switch {
-            if let Some(PickerRow::Branch(index)) = row {
-                self.branch_operation(
-                    BranchOperation::Switch(self.branches[*index].clone()),
-                    window,
-                    cx,
-                );
-            }
+        if self.picker_mode != BranchPickerMode::Review {
+            let operation = match row {
+                Some(PickerRow::Branch(index)) => {
+                    let branch = self.branches[*index].clone();
+                    match self.picker_mode {
+                        BranchPickerMode::Switch => BranchOperation::Switch(branch),
+                        BranchPickerMode::Merge => BranchOperation::Merge(branch),
+                        BranchPickerMode::PullFrom => BranchOperation::PullFrom(branch),
+                        _ => return,
+                    }
+                }
+                Some(PickerRow::Remote(index)) => {
+                    BranchOperation::Push(self.branch_remotes[*index].clone())
+                }
+                _ => return,
+            };
+            self.branch_operation(operation, window, cx);
             return;
         }
         let branch = match row {
             Some(PickerRow::Branch(index)) => self.branches[*index].name.clone(),
             Some(PickerRow::Typed) => self.branch_query.clone(),
+            Some(PickerRow::Remote(_)) => return,
             None => return,
         };
         self.start_review(branch, window, cx);
@@ -1706,7 +1772,11 @@ impl Give {
         if self.busy
             || self.opening
             || self.review_step.is_some()
-            || (self.review_branch.is_some() && matches!(operation, BranchOperation::Pull))
+            || (self.review_branch.is_some()
+                && !matches!(
+                    operation,
+                    BranchOperation::Switch(_) | BranchOperation::Fetch
+                ))
         {
             return;
         }
@@ -1718,7 +1788,10 @@ impl Give {
         let message = match &operation {
             BranchOperation::Switch(_) => "Switching branch…",
             BranchOperation::Fetch => "Fetching all remotes…",
-            BranchOperation::Pull => "Pulling current branch…",
+            BranchOperation::Pull | BranchOperation::PullFrom(_) => "Pulling current branch…",
+            BranchOperation::Push(_) => "Pushing current branch…",
+            BranchOperation::Merge(_) => "Merging into current branch…",
+            BranchOperation::AbortMerge => "Aborting merge…",
         };
         // Cancel a branch-list read before it can overwrite the post-operation list.
         self.picker_request += 1;
@@ -1735,6 +1808,16 @@ impl Give {
                     .map(|()| "Fetch complete · remote branches updated".to_owned()),
                 BranchOperation::Pull => branches::pull(&repo)
                     .map(|()| "Pull complete · current branch is up to date".to_owned()),
+                BranchOperation::PullFrom(branch) => {
+                    branches::pull_from(&repo, &branch).map(|()| {
+                        format!("Pulled from {} · upstream tracking configured", branch.name)
+                    })
+                }
+                BranchOperation::Push(remote) => branches::push(&repo, &remote),
+                BranchOperation::Merge(branch) => branches::merge(&repo, &branch),
+                BranchOperation::AbortMerge => {
+                    branches::abort_merge(&repo).map(|()| "Merge aborted".to_owned())
+                }
             };
             // Read back even after failure: a network operation may have updated refs.
             (result, repo.snapshot_with(catalog), review::branches(&repo))
@@ -1793,22 +1876,96 @@ impl Give {
         cx.notify();
     }
 
-    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
-        let text = if self.focus_left {
-            self.selected
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            self.text_selection
-                .map(|selection| selection.text(&self.diff.lines))
-                .unwrap_or_default()
-        };
-        if !text.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.notice = "Selection copied".into();
-            cx.notify();
+    fn open_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_none() || self.rendered() == Some(Rendered::Image) {
+            return;
         }
+        if self.rendered() == Some(Rendered::Markdown) {
+            self.show_source = true;
+        }
+        self.focus_left = false;
+        self.find.update(cx, |find, cx| find.open(window, cx));
+        self.search_preview(cx);
+        cx.notify();
+    }
+
+    fn search_preview(&mut self, cx: &mut Context<Self>) {
+        self.find_request += 1;
+        let request = self.find_request;
+        let query = self.find.read(cx).query.clone();
+        let diff = self.diff.clone();
+        self.find_diff = Some(diff.clone());
+        self.find_matches = Arc::default();
+        self.find_current = None;
+        let searching = !query.text.is_empty();
+        self.find
+            .update(cx, |find, cx| find.set_results(None, 0, searching, cx));
+        if !searching {
+            return;
+        }
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(75))
+                .await;
+            let current = view
+                .update(cx, |this, _| this.find_request == request)
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let source = diff.clone();
+            let matches = cx
+                .background_executor()
+                .spawn(async move { query.source_matches(&source.lines) })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.find_request != request || !Arc::ptr_eq(&this.diff, &diff) {
+                    return;
+                }
+                this.find_current = if matches.is_empty() {
+                    None
+                } else {
+                    Some(
+                        matches
+                            .iter()
+                            .position(|m| m.row >= this.preview_cursor)
+                            .unwrap_or(0),
+                    )
+                };
+                this.find_matches = Arc::new(matches);
+                this.reveal_match(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn next_match(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        self.find_current =
+            search::next_index(self.find_current, self.find_matches.len(), backwards);
+        self.reveal_match(cx);
+        cx.notify();
+    }
+
+    fn reveal_match(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self
+            .find_current
+            .and_then(|index| self.find_matches.get(index))
+        {
+            self.preview_cursor = m.row;
+            self.diff_scroll.scroll_to_item(m.row, ScrollStrategy::Top);
+            let state = self.diff_scroll.0.borrow();
+            let width = f32::from(state.base_handle.bounds().size.width);
+            let left =
+                self.diff.lines[m.row].text[..m.range.start].chars().count() as f32 * 9. + 124.;
+            let offset = state.base_handle.offset();
+            state
+                .base_handle
+                .set_offset(point(px(-(left - width / 2.).max(0.)), offset.y));
+        }
+        self.find.update(cx, |find, cx| {
+            find.set_results(self.find_current, self.find_matches.len(), false, cx)
+        });
     }
 
     fn select_all_text(&mut self, _: &SelectAllText, window: &mut Window, cx: &mut Context<Self>) {
@@ -2009,26 +2166,26 @@ impl Give {
             .map_or_else(|| path.to_owned(), |repo| repo.root.join(path))
     }
 
-    /// Right-click on a tree row: copy the file or folder's absolute path.
-    fn tree_context(&mut self, index: usize) {
-        let path = match self.tree.get(index).map(|row| &row.kind) {
-            Some(RowKind::File(file)) => &file.path,
-            Some(RowKind::Directory { path, .. }) => path,
-            _ => return,
+    /// The file or folder's absolute path, shared by right-click and Ctrl-C.
+    fn tree_copy(&self, index: usize) -> Option<ContextCopy> {
+        let path = match &self.tree.get(index)?.kind {
+            RowKind::File(file) => &file.path,
+            RowKind::Directory { path, .. } => path,
+            _ => return None,
         };
-        self.context_copy = Some(ContextCopy {
+        Some(ContextCopy {
             label: "Copy path".into(),
             text: self.absolute(path).to_string_lossy().into_owned(),
-        });
+        })
     }
 
-    /// Right-click on a preview row: the selection with its lines when the row is
-    /// inside it, otherwise the clicked line.
-    fn preview_context(&mut self, row: usize) {
-        let Some(selected) = self.selected.clone() else {
-            return;
-        };
-        let path = self.absolute(&selected);
+    fn tree_context(&mut self, index: usize) {
+        self.context_copy = self.tree_copy(index);
+    }
+
+    /// The selection with its lines when the row is inside it, otherwise that line.
+    fn preview_copy(&self, row: usize) -> Option<ContextCopy> {
+        let path = self.absolute(self.selected.as_ref()?);
         let selection = self
             .text_selection
             .filter(|selection| {
@@ -2036,7 +2193,7 @@ impl Give {
                 (start.row..=end.row).contains(&row)
             })
             .and_then(|selection| path_reference::selection(&path, &self.diff.lines, selection));
-        self.context_copy = Some(match selection {
+        Some(match selection {
             Some(text) => ContextCopy {
                 label: "Copy path with selection".into(),
                 text,
@@ -2045,7 +2202,40 @@ impl Give {
                 label: "Copy path with line".into(),
                 text: path_reference::line(&path, &self.diff.lines, row),
             },
-        });
+        })
+    }
+
+    fn preview_context(&mut self, row: usize) {
+        self.context_copy = self.preview_copy(row);
+    }
+
+    fn copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
+        let copy = if self.focus_left {
+            self.tree_cursor.and_then(|index| self.tree_copy(index))
+        } else {
+            let text = self
+                .text_selection
+                .map(|selection| selection.text(&self.diff.lines))
+                .unwrap_or_default();
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.notice = "Selection copied".into();
+                self.error = false;
+                cx.notify();
+                return;
+            }
+            self.preview_copy(self.preview_cursor)
+        };
+        if let Some(copy) = copy {
+            self.write_path(copy, cx);
+        }
+    }
+
+    fn write_path(&mut self, copy: ContextCopy, cx: &mut Context<Self>) {
+        self.notice = format!("Copied {}", copy.text.lines().next().unwrap_or_default());
+        self.error = false;
+        cx.write_to_clipboard(ClipboardItem::new_string(copy.text));
+        cx.notify();
     }
 
     /// The tree and preview context menu; an empty menu does not open.
@@ -2063,12 +2253,8 @@ impl Give {
         let view = view.clone();
         menu.item(
             PopupMenuItem::new(copy.label.clone()).on_click(move |_, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copy.text.clone()));
                 let _ = view.update(cx, |this, cx| {
-                    this.notice =
-                        format!("Copied {}", copy.text.lines().next().unwrap_or_default());
-                    this.error = false;
-                    cx.notify();
+                    this.write_path(copy.clone(), cx);
                 });
             }),
         )
@@ -3166,6 +3352,7 @@ impl Give {
                         )
                     }),
             )
+            .when(self.find.read(cx).visible, |el| el.child(self.find.clone()))
             .when(!self.preview_loading && self.selected.is_none(), |el| {
                 let branch = self.review_branch.clone().unwrap_or_default();
                 el.child(if let Some(step) = self.review_step {
@@ -3250,6 +3437,16 @@ impl Give {
                                                 .get(index)
                                                 .and_then(|row| row.get())
                                                 .unwrap_or(&fallback);
+                                            let first_match = this
+                                                .find_matches
+                                                .partition_point(|m| m.row < index);
+                                            let row_matches: Vec<_> = this
+                                                .find_matches
+                                                .iter()
+                                                .enumerate()
+                                                .skip(first_match)
+                                                .take_while(|(_, m)| m.row == index)
+                                                .collect();
                                             let mut spans = Vec::new();
                                             for span in syntax {
                                                 let mut edges =
@@ -3261,6 +3458,18 @@ impl Give {
                                                             span.range.end,
                                                         ),
                                                         selection.end.clamp(
+                                                            span.range.start,
+                                                            span.range.end,
+                                                        ),
+                                                    ]);
+                                                }
+                                                for (_, m) in &row_matches {
+                                                    edges.extend([
+                                                        m.range.start.clamp(
+                                                            span.range.start,
+                                                            span.range.end,
+                                                        ),
+                                                        m.range.end.clamp(
                                                             span.range.start,
                                                             span.range.end,
                                                         ),
@@ -3279,7 +3488,30 @@ impl Give {
                                                                 .filter(|selection| {
                                                                     selection.contains(&range.start)
                                                                 })
-                                                                .map(|_| rgb(0x3c5c7e).into()),
+                                                                .map(|_| rgb(0x3c5c7e).into())
+                                                                .or_else(|| {
+                                                                    row_matches
+                                                                        .iter()
+                                                                        .find(|(_, m)| {
+                                                                            m.range.contains(
+                                                                                &range.start,
+                                                                            )
+                                                                        })
+                                                                        .map(|(match_index, _)| {
+                                                                            rgb(
+                                                                                if Some(
+                                                                                    *match_index,
+                                                                                ) == this
+                                                                                    .find_current
+                                                                                {
+                                                                                    0x87642c
+                                                                                } else {
+                                                                                    0x514931
+                                                                                },
+                                                                            )
+                                                                            .into()
+                                                                        })
+                                                                }),
                                                             ..Default::default()
                                                         },
                                                     ));
@@ -3521,13 +3753,47 @@ impl Give {
     fn branch_picker(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.picker_rows();
         let reserved = if self.picker_note.is_some() {
-            330.
+            400.
         } else {
-            210.
+            280.
         };
         let max_height = (f32::from(window.viewport_size().height) - reserved).max(60.);
         let height = ((rows.len().clamp(1, 11) as f32) * 30.).min(max_height);
         let switching = self.picker_mode == BranchPickerMode::Switch;
+        let working = self.picker_mode != BranchPickerMode::Review;
+        let title = match self.picker_mode {
+            BranchPickerMode::Switch => "Branches".to_owned(),
+            BranchPickerMode::Review => "Review branch".to_owned(),
+            BranchPickerMode::Merge => format!("Merge a branch → {}", self.snapshot.branch),
+            BranchPickerMode::PullFrom => {
+                format!("Pull a remote branch → {}", self.snapshot.branch)
+            }
+            BranchPickerMode::Push => format!("Push {} → remote", self.snapshot.branch),
+        };
+        let hint = match self.picker_mode {
+            BranchPickerMode::Switch => {
+                "Choose a local branch or check out a remote branch with tracking."
+            }
+            BranchPickerMode::Review => {
+                "Fetches all remotes, then compares with the open GitLab MR or the merge-base with main."
+            }
+            BranchPickerMode::Merge => {
+                "Choose the source branch to merge into the current branch. Conflicts will be shown here."
+            }
+            BranchPickerMode::PullFrom => {
+                "Choose the remote source. Fast-forward only; saves upstream tracking after success."
+            }
+            BranchPickerMode::Push => {
+                "Choose a remote. Publishes the current branch with the same name and sets upstream tracking."
+            }
+        };
+        let keys = match self.picker_mode {
+            BranchPickerMode::Switch => "↑↓ choose · Enter switch · Esc close",
+            BranchPickerMode::Review => "↑↓ choose · Enter review · Esc close",
+            BranchPickerMode::Merge => "↑↓ choose · Enter merge · Esc close",
+            BranchPickerMode::PullFrom => "↑↓ choose · Enter pull · Esc close",
+            BranchPickerMode::Push => "↑↓ choose · Enter push · Esc close",
+        };
         let panel = div()
                     .key_context("BranchPicker")
                     .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.move_picker(-1, cx)))
@@ -3558,16 +3824,16 @@ impl Give {
                                 div()
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(if switching { "Branches" } else { "Review branch" }),
+                                    .child(title),
                             )
                             .child(
                                 div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                                    if switching { "Choose a local branch or check out a remote branch with tracking." } else { "Fetches all remotes, then compares with the open GitLab MR or the merge-base with main." },
+                                    hint,
                                 ),
                             ),
                     )
                     .when(switching, |el| el.child(
-                        div().px_3().pb_2().flex().gap_2()
+                        div().px_3().pb_2().flex().flex_wrap().gap_2()
                             .child(Button::new("fetch-branches").ghost().xsmall()
                                 .label("Fetch all remotes")
                                 .disabled(self.busy || self.branches_loading || self.review_step.is_some())
@@ -3581,6 +3847,45 @@ impl Give {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.branch_operation(BranchOperation::Pull, window, cx)
                                 })))
+                            .child(Button::new("pull-from").ghost().xsmall()
+                                .label("Pull from…")
+                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_branch_picker(BranchPickerMode::PullFrom, window, cx)
+                                })))
+                            .child(Button::new("push-branch").ghost().xsmall()
+                                .label("Push current branch…")
+                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_branch_picker(BranchPickerMode::Push, window, cx)
+                                })))
+                            .child(Button::new("merge-branch").ghost().xsmall()
+                                .label("Merge into current…")
+                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_branch_picker(BranchPickerMode::Merge, window, cx)
+                                })))
+                            .child(Button::new("abort-merge").ghost().xsmall()
+                                .label("Abort merge")
+                                .disabled(self.busy || self.review_branch.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.branch_operation(BranchOperation::AbortMerge, window, cx)
+                                })))
+                    ))
+                    .when(working && !switching, |el| el.child(
+                        div().px_3().pb_2().flex().gap_2().child(Button::new("back-to-branches").ghost().xsmall()
+                            .label("Back to branches")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_branch_picker(BranchPickerMode::Switch, window, cx)
+                            })))
+                            .when(self.picker_mode == BranchPickerMode::Merge, |el| el.child(
+                                Button::new("abort-current-merge").ghost().xsmall()
+                                    .label("Abort merge")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.branch_operation(BranchOperation::AbortMerge, window, cx)
+                                    }))))
                     ))
                     .child(
                         div().px_3().pb_2().child(
@@ -3604,8 +3909,10 @@ impl Give {
                                         .text_color(rgb(MUTED))
                                         .child(if self.branches_loading {
                                             "Loading branches…"
+                                        } else if self.picker_mode == BranchPickerMode::Push {
+                                            "No remotes. Configure a Git remote first."
                                         } else {
-                                            "No branches"
+                                            "No matching branches. Clear the filter or fetch remotes."
                                         }),
                                 )
                             })
@@ -3658,10 +3965,10 @@ impl Give {
                                     } else if self.branches_loading {
                                         "Loading branches…".to_owned()
                                     } else {
-                                        format!("{} branches", self.branches.len())
+                                        format!("{} {}", rows.len(), if self.picker_mode == BranchPickerMode::Push { "remotes" } else { "branches" })
                                     }),
                             )
-                            .child(if switching { "↑↓ choose · Enter switch · Esc close" } else { "↑↓ choose · Enter review · Esc close" }),
+                            .child(keys),
                     );
 
         let backdrop = div()
@@ -3673,7 +3980,7 @@ impl Give {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.close_picker(window, cx)),
             );
-        if switching {
+        if working {
             let bounds = self.branch_button_bounds.get();
             backdrop.child(
                 anchored()
@@ -3706,6 +4013,14 @@ impl Give {
                     branch.current,
                 )
             }
+            PickerRow::Remote(i) => (
+                format!(
+                    "{} → {}/{}",
+                    self.snapshot.branch, self.branch_remotes[i], self.snapshot.branch
+                ),
+                "remote",
+                false,
+            ),
             PickerRow::Typed => (format!("Review “{}”", self.branch_query), "", false),
         };
         div()
@@ -3832,6 +4147,14 @@ impl Give {
 
 impl Render for Give {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.find.read(cx).visible
+            && self
+                .find_diff
+                .as_ref()
+                .is_none_or(|diff| !Arc::ptr_eq(diff, &self.diff))
+        {
+            self.search_preview(cx);
+        }
         self.publish_selection(window);
         div()
             .key_context("Give")
@@ -3839,7 +4162,8 @@ impl Render for Give {
             .on_action(cx.listener(Self::open_picker))
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::copy_diff))
-            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::copy_path))
+            .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::select_all_text))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.extend_selection(0, -1, cx)))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.extend_selection(0, 1, cx)))

@@ -7,6 +7,7 @@ pub mod preview_cache;
 pub mod recent;
 pub mod review;
 pub mod scrollbar;
+pub mod search;
 pub mod terminal;
 pub mod terminal_glyphs;
 pub mod text_selection;

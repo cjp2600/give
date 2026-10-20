@@ -73,12 +73,15 @@ pub struct Snapshot {
 impl Snapshot {
     /// A changed file, or a clean catalog file.
     pub fn file(&self, path: &Path) -> Option<&ChangedFile> {
-        self.files.iter().find(|file| file.path == path).or_else(|| {
-            self.catalog
-                .binary_search_by(|file| file.path.as_path().cmp(path))
-                .ok()
-                .map(|i| &self.catalog[i])
-        })
+        self.files
+            .iter()
+            .find(|file| file.path == path)
+            .or_else(|| {
+                self.catalog
+                    .binary_search_by(|file| file.path.as_path().cmp(path))
+                    .ok()
+                    .map(|i| &self.catalog[i])
+            })
     }
 }
 
@@ -468,7 +471,10 @@ pub fn merge_catalog(files: &[ChangedFile], listed: &[u8]) -> Result<Vec<Changed
         .iter()
         .map(|file| (file.path.clone(), file.clone()))
         .collect();
-    for record in listed.split(|b| *b == 0).filter(|record| !record.is_empty()) {
+    for record in listed
+        .split(|b| *b == 0)
+        .filter(|record| !record.is_empty())
+    {
         let path = path_from_bytes(record)?;
         catalog.entry(path.clone()).or_insert(ChangedFile {
             path,

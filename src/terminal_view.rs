@@ -1,6 +1,11 @@
 //! GPUI terminal renderer. The PTY and ANSI state live in give::terminal.
 use alacritty_terminal::event::Event;
-use give::terminal::{self, CellFlags, CursorKind, Frame, Mode, SelectionKind, Size, Terminal};
+use give::{
+    search,
+    terminal::{
+        self, CellFlags, CursorKind, Frame, Mode, SearchMatch, SelectionKind, Size, Terminal,
+    },
+};
 use gpui::{prelude::*, *};
 use gpui_component::{
     Sizable,
@@ -26,6 +31,7 @@ actions!(terminal, [TerminalCopy, TerminalPaste, TerminalSelectAll]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("secondary-f", crate::Find, Some("Terminal && !Input")),
         KeyBinding::new("secondary-c", TerminalCopy, Some("Terminal")),
         KeyBinding::new("secondary-v", TerminalPaste, Some("Terminal")),
         KeyBinding::new("secondary-a", TerminalSelectAll, Some("Terminal")),
@@ -69,13 +75,35 @@ pub struct TerminalView {
     generation: u64,
     blink: bool,
     blink_at: Instant,
+    find: Entity<crate::find_view::FindPanel>,
+    find_matches: Arc<Vec<SearchMatch>>,
+    find_current: Option<usize>,
+    find_request: u64,
+    find_revision: Option<u64>,
+    find_pending: bool,
+    find_started: Instant,
     _subscriptions: Vec<Subscription>,
 }
 
 impl TerminalView {
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
+        let find = cx.new(|cx| crate::find_view::FindPanel::new(window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(&find, window, |this, _, event, window, cx| {
+                match event {
+                    crate::find_view::Event::Changed => this.search_terminal(true, cx),
+                    crate::find_view::Event::Next => this.next_match(false, cx),
+                    crate::find_view::Event::Previous => this.next_match(true, cx),
+                    crate::find_view::Event::Closed => {
+                        this.find_request += 1;
+                        this.find_pending = false;
+                        this.find_matches = Arc::default();
+                        this.focus.focus(window);
+                    }
+                }
+                cx.notify();
+            }),
             cx.on_focus(&focus, window, |this, _, cx| {
                 this.focus_event(true);
                 this.blink = true;
@@ -118,6 +146,13 @@ impl TerminalView {
             generation: 0,
             blink: true,
             blink_at: Instant::now(),
+            find,
+            find_matches: Arc::default(),
+            find_current: None,
+            find_request: 0,
+            find_revision: None,
+            find_pending: false,
+            find_started: Instant::now(),
             _subscriptions: subscriptions,
         };
         this.launch(cx);
@@ -142,6 +177,10 @@ impl TerminalView {
     }
 
     fn launch(&mut self, cx: &mut Context<Self>) {
+        self.find_request += 1;
+        self.find_pending = false;
+        self.find_revision = None;
+        self.find_matches = Arc::default();
         self.generation += 1;
         let generation = self.generation;
         self.input.clear();
@@ -341,6 +380,121 @@ impl TerminalView {
         if changed && self.active {
             cx.notify();
         }
+        if self.active
+            && self.find.read(cx).visible
+            && !self.find_pending
+            && !self.find.read(cx).query.text.is_empty()
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|frame| Some(frame.content_revision) != self.find_revision)
+            && self.find_started.elapsed() >= Duration::from_millis(200)
+        {
+            self.search_terminal(false, cx);
+        }
+    }
+
+    fn open_find(&mut self, _: &crate::Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.update(cx, |find, cx| find.open(window, cx));
+        self.search_terminal(true, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn search_terminal(&mut self, reveal: bool, cx: &mut Context<Self>) {
+        self.find_request += 1;
+        let request = self.find_request;
+        let query = self.find.read(cx).query.clone();
+        if reveal {
+            self.find_matches = Arc::default();
+            self.find_current = None;
+        }
+        if query.text.is_empty() {
+            self.find_pending = false;
+            self.find
+                .update(cx, |find, cx| find.set_results(None, 0, false, cx));
+            return;
+        }
+        let Some(source) = self.terminal.as_ref().map(Terminal::search_source) else {
+            return;
+        };
+        self.find_pending = true;
+        self.find_started = Instant::now();
+        self.find.update(cx, |find, cx| {
+            find.set_results(self.find_current, self.find_matches.len(), true, cx)
+        });
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(75))
+                .await;
+            let current = view
+                .update(cx, |this, _| this.find_request == request)
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let result = cx
+                .background_executor()
+                .spawn(async move { source.search(&query) })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.find_request != request {
+                    return;
+                }
+                this.find_pending = false;
+                this.find_revision = Some(result.revision);
+                let previous = this
+                    .find_current
+                    .and_then(|index| this.find_matches.get(index))
+                    .cloned();
+                let first_visible = -(this.frame.as_ref().map_or(0, |f| f.display_offset) as i32);
+                this.find_current = if result.matches.is_empty() {
+                    None
+                } else {
+                    Some(
+                        previous
+                            .and_then(|m| result.matches.iter().position(|next| next == &m))
+                            .unwrap_or_else(|| {
+                                result
+                                    .matches
+                                    .iter()
+                                    .position(|m| m.start().line.0 >= first_visible)
+                                    .unwrap_or(0)
+                            }),
+                    )
+                };
+                this.find_matches = Arc::new(result.matches);
+                this.reveal_match(reveal, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn next_match(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        self.find_current =
+            search::next_index(self.find_current, self.find_matches.len(), backwards);
+        self.reveal_match(true, cx);
+        cx.notify();
+    }
+
+    fn reveal_match(&mut self, reveal: bool, cx: &mut Context<Self>) {
+        if reveal
+            && let Some(m) = self
+                .find_current
+                .and_then(|index| self.find_matches.get(index))
+        {
+            if let Some(terminal) = &self.terminal {
+                terminal.reveal_match(m);
+            }
+            let column = m.start().column.0 as f32 * self.cell_width;
+            let width = f32::from(self.bounds.get().size.width);
+            self.scroll_x = (column - width / 2.).max(0.);
+        }
+        self.find.update(cx, |find, cx| {
+            find.set_results(self.find_current, self.find_matches.len(), false, cx)
+        });
+        self.poll(cx);
     }
 
     fn copy(&mut self, _: &TerminalCopy, _: &mut Window, cx: &mut Context<Self>) {
@@ -375,6 +529,9 @@ impl TerminalView {
         }
     }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            return;
+        }
         let stroke = &event.keystroke;
         if stroke.modifiers.platform {
             return;
@@ -618,6 +775,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::open_find))
             .on_key_down(cx.listener(Self::key_down))
             .child(
                 div()
@@ -651,6 +809,7 @@ impl Render for TerminalView {
                         },
                     ),
             )
+            .when(self.find.read(cx).visible, |el| el.child(self.find.clone()))
             .child(
                 div()
                     .id("terminal-grid")
@@ -760,8 +919,17 @@ impl Render for TerminalView {
                                         point(bounds.left() - px(scroll_x), bounds.top()),
                                         size(px(grid_width), bounds.size.height),
                                     );
+                                    let view = paint_entity.read(cx);
+                                    let current = view.find_current;
+                                    let found = view.find_matches.clone();
+                                    let matches =
+                                        if view.find_revision == Some(frame.content_revision) {
+                                            found.as_slice()
+                                        } else {
+                                            &[]
+                                        };
                                     paint_frame(
-                                        &frame,
+                                        (&frame, matches, current),
                                         grid,
                                         cell_width,
                                         (focused, blink),
@@ -877,7 +1045,7 @@ fn paint_cell_rects(
 }
 
 fn paint_frame(
-    frame: &Frame,
+    (frame, matches, current): (&Frame, &[SearchMatch], Option<usize>),
     bounds: Bounds<Pixels>,
     width: f32,
     cursor_state: (bool, bool),
@@ -898,8 +1066,20 @@ fn paint_frame(
             bounds.top() + px(cell.row as f32 * ROW_HEIGHT),
         );
         let is_cursor = cursor.is_some_and(|(row, col, _)| row == cell.row && col == cell.column);
+        let point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(cell.row as i32 - frame.display_offset as i32),
+            alacritty_terminal::index::Column(cell.column),
+        );
+        let index = matches.partition_point(|m| *m.end() < point);
+        let matched = matches.get(index).is_some_and(|m| m.contains(&point));
         let mut background = if cell.selected {
             0x355575
+        } else if matched {
+            if Some(index) == current {
+                0x87642c
+            } else {
+                0x514931
+            }
         } else {
             cell.background
         };
