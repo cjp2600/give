@@ -61,7 +61,10 @@ func selected() -> String? {
     guard let focused = attr(axApp,"AXFocusedUIElement") else { return nil }
     return attr(focused as! AXUIElement,"AXSelectedText") as? String
 }
-key(48); key(0,.maskCommand)
+// Startup focuses the full-width terminal. Return focus to the tree, open
+// the fixture explicitly, and hide the terminal while checking the preview.
+key(18,.maskCommand); key(18,.maskCommand)
+key(36); key(19,.maskCommand); key(0,.maskCommand)
 check(wait { selected()?.contains("Selection reader test") == true }, "preview AXSelectedText including Cyrillic")
 key(8,.maskCommand)
 check(pasteboard.string(forType:.string)?.contains("Selection reader test") == true, "preview Cmd+C")

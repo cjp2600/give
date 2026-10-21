@@ -47,6 +47,10 @@ impl Text {
         #[cfg(target_os = "macos")]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            // GPUI's test windows have no native AppKit view.
+            if cfg!(test) {
+                return;
+            }
             let Ok(handle) = HasWindowHandle::window_handle(window) else {
                 return;
             };

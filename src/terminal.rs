@@ -901,4 +901,39 @@ mod tests {
         a.write("первый проект\r".as_bytes().to_vec());
         assert!(wait_for(&a, "DONE").text.contains("INPUT:первый проект"));
     }
+
+    #[test]
+    fn quick_session_in_same_directory_does_not_interrupt_main_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = |script: &str| {
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", script]);
+            Terminal::spawn_command(
+                directory.path(),
+                Size {
+                    rows: 12,
+                    cols: 120,
+                    pixel_width: 960,
+                    pixel_height: 240,
+                },
+                command,
+            )
+            .unwrap()
+        };
+        let main = start(
+            "stty -echo; printf 'MAIN_READY\\n'; IFS= read -r line; printf 'MAIN_INPUT:%s\\n' \"$line\"",
+        );
+        wait_for(&main, "MAIN_READY");
+        let quick = start("printf 'QUICK_ROOT:%s\\nQUICK_DONE\\n' \"$PWD\"");
+        assert!(
+            wait_for(&quick, "QUICK_DONE")
+                .text
+                .contains(directory.path().canonicalize().unwrap().to_str().unwrap())
+        );
+        drop(quick);
+        assert!(main.frame().unwrap().exited.is_none());
+        main.write(b"still running\r".to_vec());
+        let frame = wait_for(&main, "MAIN_INPUT:still running");
+        assert!(!frame.text.contains("QUICK_DONE"));
+    }
 }

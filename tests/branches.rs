@@ -408,6 +408,138 @@ fn push_rejection_preserves_remote_history_even_with_force_push_refspec_configur
 }
 
 #[test]
+fn commit_and_push_publishes_only_the_index_on_the_current_branch() {
+    let f = Fixture::new();
+    git(&f.repo.root, &["switch", "-c", "quick-commit"]);
+    fs::write(f.repo.root.join("file.txt"), "staged content\n").unwrap();
+    git(&f.repo.root, &["add", "file.txt"]);
+    fs::write(f.repo.root.join("file.txt"), "unstaged content\n").unwrap();
+    fs::write(f.repo.root.join("untracked.txt"), "leave me local\n").unwrap();
+    let outcome = branches::commit_and_push(&f.repo, "Ship staged changes").unwrap();
+    assert!(matches!(outcome, branches::CommitPushOutcome::Pushed(_)));
+    assert_eq!(
+        git(&f.remote, &["rev-parse", "refs/heads/quick-commit"]),
+        f.head()
+    );
+    assert_eq!(
+        git(&f.remote, &["show", "quick-commit:file.txt"]),
+        "staged content"
+    );
+    assert_eq!(
+        git(&f.repo.root, &["log", "-1", "--format=%s"]),
+        "Ship staged changes"
+    );
+    assert_eq!(
+        git(&f.repo.root, &["config", "branch.quick-commit.remote"]),
+        "origin"
+    );
+    assert_eq!(
+        fs::read_to_string(f.repo.root.join("file.txt")).unwrap(),
+        "unstaged content\n"
+    );
+    assert_eq!(f.repo.snapshot().unwrap().files.len(), 2);
+}
+
+#[test]
+fn commit_and_push_uses_configured_push_remote_before_tracking_remote() {
+    let f = Fixture::new();
+    for remote in ["default-push", "branch-push"] {
+        git(
+            &f.repo.root,
+            &["remote", "add", remote, f.remote.to_str().unwrap()],
+        );
+    }
+    git(
+        &f.repo.root,
+        &["config", "remote.pushDefault", "default-push"],
+    );
+    fs::write(f.repo.root.join("file.txt"), "default remote\n").unwrap();
+    git(&f.repo.root, &["add", "file.txt"]);
+    assert!(matches!(
+        branches::commit_and_push(&f.repo, "Use default remote").unwrap(),
+        branches::CommitPushOutcome::Pushed(_)
+    ));
+    assert_eq!(
+        git(&f.repo.root, &["config", "branch.main.remote"]),
+        "default-push"
+    );
+    git(
+        &f.repo.root,
+        &["config", "branch.main.pushRemote", "branch-push"],
+    );
+    fs::write(f.repo.root.join("file.txt"), "branch remote\n").unwrap();
+    git(&f.repo.root, &["add", "file.txt"]);
+    assert!(matches!(
+        branches::commit_and_push(&f.repo, "Use branch remote").unwrap(),
+        branches::CommitPushOutcome::Pushed(_)
+    ));
+    assert_eq!(
+        git(&f.repo.root, &["config", "branch.main.remote"]),
+        "branch-push"
+    );
+    assert_eq!(git(&f.remote, &["rev-parse", "main"]), f.head());
+}
+
+#[test]
+fn commit_and_push_reports_rejected_push_as_a_successful_local_commit() {
+    let f = Fixture::new();
+    commit(&f.publisher, "remote advance\n");
+    git(&f.publisher, &["push", "--quiet", "origin", "main"]);
+    let remote_head = git(&f.remote, &["rev-parse", "main"]);
+    let before = f.head();
+    fs::write(f.repo.root.join("file.txt"), "local change\n").unwrap();
+    git(&f.repo.root, &["add", "file.txt"]);
+    let outcome = branches::commit_and_push(&f.repo, "Keep local commit").unwrap();
+    assert!(matches!(
+        outcome,
+        branches::CommitPushOutcome::PushFailed(_)
+    ));
+    assert_ne!(f.head(), before);
+    assert_eq!(git(&f.repo.root, &["rev-parse", "HEAD^"]), before);
+    assert_eq!(git(&f.remote, &["rev-parse", "main"]), remote_head);
+    assert!(f.repo.snapshot().unwrap().files.is_empty());
+}
+
+#[test]
+fn commit_and_push_checks_destination_before_committing_and_skips_push_if_commit_fails() {
+    let f = Fixture::new();
+    let before = f.head();
+    fs::write(f.repo.root.join("file.txt"), "pending commit\n").unwrap();
+    git(&f.repo.root, &["add", "file.txt"]);
+    assert!(branches::commit_and_push(&f.repo, " ").is_err());
+    assert_eq!(git(&f.remote, &["rev-parse", "main"]), before);
+    git(
+        &f.repo.root,
+        &["config", "branch.main.pushRemote", "missing"],
+    );
+    assert!(branches::commit_and_push(&f.repo, "Invalid remote").is_err());
+    git(
+        &f.repo.root,
+        &["config", "--unset", "branch.main.pushRemote"],
+    );
+    git(&f.repo.root, &["remote", "remove", "origin"]);
+    assert!(branches::commit_and_push(&f.repo, "No remote").is_err());
+    for remote in ["one", "two"] {
+        git(
+            &f.repo.root,
+            &["remote", "add", remote, f.remote.to_str().unwrap()],
+        );
+    }
+    assert!(branches::commit_and_push(&f.repo, "Ambiguous remote").is_err());
+    git(&f.repo.root, &["switch", "--detach", "HEAD"]);
+    assert!(branches::commit_and_push(&f.repo, "Detached HEAD").is_err());
+    assert_eq!(f.head(), before);
+    assert!(
+        f.repo
+            .snapshot()
+            .unwrap()
+            .files
+            .iter()
+            .any(|file| file.staged())
+    );
+}
+
+#[test]
 fn merge_creates_a_commit_for_clean_divergence_without_opening_an_editor() {
     let f = Fixture::new();
     git(&f.repo.root, &["switch", "-c", "topic"]);

@@ -1,0 +1,65 @@
+%YAML 1.2
+---
+# Protocol Buffers, including proto3 fields and streaming RPCs.
+name: Protocol Buffers
+file_extensions: [proto]
+scope: source.proto
+
+variables:
+  ident: '[A-Za-z_][A-Za-z0-9_]*'
+
+contexts:
+  main:
+    - match: '//.*$'
+      scope: comment.line.double-slash.proto
+    - match: '/\*'
+      scope: punctuation.definition.comment.begin.proto
+      push: block_comment
+    - match: '"'
+      push: double_string
+    - match: "'"
+      push: single_string
+    - match: '\b(message|enum|service|oneof)\s+({{ident}})'
+      captures:
+        1: storage.type.proto
+        2: entity.name.class.proto
+    - match: '\b(rpc)\s+({{ident}})'
+      captures:
+        1: keyword.declaration.proto
+        2: entity.name.function.proto
+    - match: '\b(?:syntax|import|weak|public|package|option|reserved|to|max|returns|stream)\b'
+      scope: keyword.other.proto
+    - match: '\b(?:optional|repeated)\b'
+      scope: storage.modifier.proto
+    - match: '\b(?:double|float|int32|int64|uint32|uint64|sint32|sint64|fixed32|fixed64|sfixed32|sfixed64|bool|string|bytes|map)\b'
+      scope: storage.type.primitive.proto
+    - match: '\b(?:true|false|inf|nan)\b'
+      scope: constant.language.proto
+    - match: '\b0[xX][0-9A-Fa-f]+\b'
+      scope: constant.numeric.hex.proto
+    - match: '(?:\b\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\b'
+      scope: constant.numeric.proto
+    - match: '\b(?:{{ident}}\.)*{{ident}}(?=\s+{{ident}}\s*=)'
+      scope: support.class.proto
+    - match: '\b(?:{{ident}}\.)*[A-Z][A-Za-z0-9_]*\b'
+      scope: support.class.proto
+
+  block_comment:
+    - meta_scope: comment.block.proto
+    - match: '\*/'
+      scope: punctuation.definition.comment.end.proto
+      pop: true
+
+  double_string:
+    - meta_scope: string.quoted.double.proto
+    - match: '\\.'
+      scope: constant.character.escape.proto
+    - match: '"'
+      pop: true
+
+  single_string:
+    - meta_scope: string.quoted.single.proto
+    - match: '\\.'
+      scope: constant.character.escape.proto
+    - match: "'"
+      pop: true

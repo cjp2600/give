@@ -178,6 +178,47 @@ pub fn push(repo: &Repository, remote: &str) -> Result<String> {
     ))
 }
 
+#[derive(Debug)]
+pub enum CommitPushOutcome {
+    Pushed(String),
+    PushFailed(String),
+}
+
+/// Commit the existing index, then publish the current branch. Resolve the
+/// destination first so a missing/ambiguous remote does not create a commit.
+/// A push failure is a completed local commit, not a failed commit to retry.
+pub fn commit_and_push(repo: &Repository, message: &str) -> Result<CommitPushOutcome> {
+    let name = current(repo)?;
+    let remotes = remotes(repo)?;
+    let configured = [
+        format!("branch.{name}.pushRemote"),
+        "remote.pushDefault".to_owned(),
+        format!("branch.{name}.remote"),
+    ]
+    .into_iter()
+    .find_map(|key| {
+        git::run(&repo.root, ["config", "--get", &key], None, false)
+            .ok()
+            .map(|raw| String::from_utf8_lossy(&raw).trim().to_owned())
+    });
+    let remote = match configured {
+        Some(remote) if remotes.contains(&remote) => remote,
+        Some(remote) => {
+            bail!("Push remote '{remote}' is not configured. Choose a remote in the branch menu.")
+        }
+        None if remotes.len() == 1 => remotes[0].clone(),
+        None if remotes.iter().any(|remote| remote == "origin") => "origin".to_owned(),
+        None => {
+            bail!("No default push remote. Choose a remote with ‘Push…’ in the branch menu first.")
+        }
+    };
+    repo.commit(message)?;
+    Ok(match push(repo, &remote) {
+        Ok(message) => CommitPushOutcome::Pushed(message),
+        Err(error) => CommitPushOutcome::PushFailed(format!("{error:#}")),
+    })
+}
+
 /// Merge a selected full branch ref into the checked-out branch.
 pub fn merge(repo: &Repository, branch: &Branch) -> Result<String> {
     let target = current(repo)?;

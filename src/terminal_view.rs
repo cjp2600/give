@@ -8,7 +8,7 @@ use give::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Sizable,
+    Sizable, WindowExt,
     button::{Button, ButtonVariants},
 };
 use std::{
@@ -27,7 +27,17 @@ const ROW_HEIGHT: f32 = 17.;
 /// The grid is never narrower than this; a narrower panel scrolls horizontally,
 /// a wider one gets as many columns as fit.
 const MIN_COLUMNS: u16 = 100;
-actions!(terminal, [TerminalCopy, TerminalPaste, TerminalSelectAll]);
+actions!(
+    terminal,
+    [
+        TerminalCopy,
+        TerminalPaste,
+        TerminalSelectAll,
+        CloseQuickTerminal
+    ]
+);
+
+struct QuickTerminalClose;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -37,6 +47,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-a", TerminalSelectAll, Some("Terminal")),
         KeyBinding::new("ctrl-shift-c", TerminalCopy, Some("Terminal")),
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
+        KeyBinding::new("secondary-w", CloseQuickTerminal, Some("QuickTerminal")),
     ]);
 }
 
@@ -46,6 +57,9 @@ enum Input {
 }
 
 pub struct TerminalView {
+    is_quick: bool,
+    quick_terminal: Option<Entity<TerminalView>>,
+    quick_open: bool,
     accessibility: crate::accessibility::Text,
     terminal: Option<Terminal>,
     frame: Option<Arc<Frame>>,
@@ -85,6 +99,8 @@ pub struct TerminalView {
     _subscriptions: Vec<Subscription>,
 }
 
+impl EventEmitter<QuickTerminalClose> for TerminalView {}
+
 impl TerminalView {
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
@@ -115,6 +131,9 @@ impl TerminalView {
             }),
         ];
         let mut this = Self {
+            is_quick: false,
+            quick_terminal: None,
+            quick_open: false,
             accessibility: crate::accessibility::Text::default(),
             terminal: None,
             frame: None,
@@ -219,11 +238,19 @@ impl TerminalView {
     }
 
     pub fn set_visible(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !active && self.quick_open {
+            self.finish_quick_terminal(window, cx);
+            window.close_dialog(cx);
+        }
         self.active = active;
         self.accessibility.invalidate();
         self.accessibility.publish(
-            1,
-            "Terminal",
+            if self.is_quick { 2 } else { 1 },
+            if self.is_quick {
+                "Quick terminal"
+            } else {
+                "Terminal"
+            },
             active && self.focus.is_focused(window),
             active,
             self.bounds.get(),
@@ -233,6 +260,91 @@ impl TerminalView {
             self.poll(cx);
             self.focus.focus(window);
         }
+    }
+
+    fn open_quick_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_quick || window.has_active_dialog(cx) {
+            return;
+        }
+        let quick = if let Some(quick) = &self.quick_terminal {
+            quick.clone()
+        } else {
+            let quick = cx.new(|cx| {
+                let mut view = Self::new(self.path.clone(), window, cx);
+                view.is_quick = true;
+                view
+            });
+            self._subscriptions.push(cx.subscribe_in(
+                &quick,
+                window,
+                |this, _, _: &QuickTerminalClose, window, cx| {
+                    this.finish_quick_terminal(window, cx);
+                    window.close_dialog(cx);
+                },
+            ));
+            self.quick_terminal = Some(quick.clone());
+            quick
+        };
+        // Hide the main terminal from selection readers while the modal owns input.
+        // Its PTY and running processes continue independently.
+        self.set_visible(false, window, cx);
+        self.quick_open = true;
+        let owner = cx.entity().downgrade();
+        let directory = self.path.to_string_lossy().into_owned();
+        let content = quick.clone();
+        window.open_dialog(cx, move |dialog, window, _| {
+            let viewport = window.viewport_size();
+            let width = (f32::from(viewport.width) - 80.).min(1040.);
+            let height = (f32::from(viewport.height) - 120.).min(600.);
+            let owner = owner.clone();
+            dialog
+                .title(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .pr_10()
+                        .flex()
+                        .gap_3()
+                        .text_size(px(12.))
+                        .child("Quick terminal")
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(rgb(0x7a8da5))
+                                .child(directory.clone()),
+                        ),
+                )
+                .width(px(width))
+                .margin_top(px((f32::from(viewport.height) - height) / 2. - 30.))
+                .p_0()
+                .gap_0()
+                .overflow_hidden()
+                // Enter, Escape and other shell/TUI keys belong to the terminal.
+                .keyboard(false)
+                .child(
+                    div()
+                        .debug_selector(|| "quick-terminal-content".into())
+                        .w_full()
+                        .h(px(height - 40.))
+                        .child(content.clone()),
+                )
+                .on_close(move |_, window, cx| {
+                    let _ = owner.update(cx, |this, cx| this.finish_quick_terminal(window, cx));
+                })
+        });
+        quick.update(cx, |view, cx| view.set_visible(true, window, cx));
+        cx.notify();
+    }
+
+    fn finish_quick_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_open = false;
+        if let Some(quick) = &self.quick_terminal {
+            quick.update(cx, |view, cx| view.set_visible(false, window, cx));
+        }
+        self.set_visible(true, window, cx);
+        cx.notify();
     }
 
     fn mode(&self) -> Mode {
@@ -754,8 +866,12 @@ fn modifiers(m: gpui::Modifiers) -> terminal::Modifiers {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.accessibility.publish(
-            1,
-            "Terminal",
+            if self.is_quick { 2 } else { 1 },
+            if self.is_quick {
+                "Quick terminal"
+            } else {
+                "Terminal"
+            },
             self.active && self.focus.is_focused(window),
             self.active,
             self.bounds.get(),
@@ -765,7 +881,11 @@ impl Render for TerminalView {
         let paint_entity = entity.clone();
         let bounds_cell = self.bounds.clone();
         div()
-            .key_context("Terminal")
+            .key_context(if self.is_quick {
+                "Terminal QuickTerminal"
+            } else {
+                "Terminal"
+            })
             .track_focus(&self.focus)
             .size_full()
             .flex()
@@ -776,6 +896,12 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(|this, _: &CloseQuickTerminal, _, cx| {
+                if this.is_quick {
+                    cx.emit(QuickTerminalClose);
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(Self::key_down))
             .child(
                 div()
@@ -788,7 +914,14 @@ impl Render for TerminalView {
                     .border_b_1()
                     .border_color(rgb(0x2a394b))
                     .text_size(px(12.))
-                    .child(div().truncate().child(self.title.clone()))
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(self.title.clone()),
+                    )
                     .when(
                         self.error.is_some() && self.terminal.is_none()
                             || self
@@ -807,7 +940,26 @@ impl Render for TerminalView {
                                     })),
                             )
                         },
-                    ),
+                    )
+                    .when(!self.is_quick, |el| {
+                        el.child(
+                            div()
+                                .debug_selector(|| "quick-terminal-launcher".into())
+                                .child(
+                                    Button::new("quick-terminal")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            gpui_component::Icon::empty()
+                                                .path("icons/terminal.svg"),
+                                        )
+                                        .tooltip("Open quick terminal")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_quick_terminal(window, cx);
+                                        })),
+                                ),
+                        )
+                    }),
             )
             .when(self.find.read(cx).visible, |el| el.child(self.find.clone()))
             .child(

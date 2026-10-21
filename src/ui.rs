@@ -20,7 +20,7 @@ use give::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme as _, Disableable, Sizable, TitleBar,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariants, DropdownButton},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     text::{TextView, TextViewStyle},
@@ -129,8 +129,6 @@ pub struct Give {
     selected: Option<PathBuf>,
     /// Open preview tabs in display order; `selected` is the active one.
     tabs: Vec<PathBuf>,
-    /// An explicitly closed tab stays closed across tree rebuilds and Git polling.
-    preview_closed: bool,
     diff: Arc<Diff>,
     /// Markdown and SVG files open rendered; this shows their source with changes.
     show_source: bool,
@@ -262,8 +260,11 @@ impl Give {
         cx: &mut Context<Self>,
     ) -> Self {
         let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
-        let commit_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Describe your changes…"));
+        let commit_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Describe your changes…")
+                .auto_grow(3, 6)
+        });
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Branch name, local or remote…"));
         let find = cx.new(|cx| crate::find_view::FindPanel::new(window, cx));
@@ -362,7 +363,6 @@ impl Give {
             syntax_pending: HashSet::new(),
             selected: None,
             tabs: Vec::new(),
-            preview_closed: false,
             diff: Arc::default(),
             show_source: false,
             image: None,
@@ -552,8 +552,7 @@ impl Give {
                     })
             })
             .or_else(|| self.tree.iter().position(TreeRow::navigable));
-        // Tabs of files that are no longer listed close; the cursor file replaces a
-        // closed active tab.
+        // Refreshes can close stale tabs, but only user navigation opens a file.
         let listed = if self.catalog() {
             &self.snapshot.catalog
         } else {
@@ -570,20 +569,10 @@ impl Give {
             self.selected = None;
             self.reset_preview_position();
         }
-        if self.selected.is_some() || self.preview_closed {
+        if self.selected.is_some() {
             return;
         }
-        let cursor_file = self.tree_cursor.and_then(|i| match &self.tree[i].kind {
-            RowKind::File(file) => Some(file.path.clone()),
-            _ => None,
-        });
-        if let Some(path) = cursor_file {
-            if !self.tabs.contains(&path) {
-                let index = active.unwrap_or(self.tabs.len()).min(self.tabs.len());
-                self.tabs.insert(index, path.clone());
-            }
-            self.selected = Some(path);
-        } else if let Some(index) = active.filter(|_| !self.tabs.is_empty()) {
+        if let Some(index) = active.filter(|_| !self.tabs.is_empty()) {
             self.selected = Some(self.tabs[index.min(self.tabs.len() - 1)].clone());
         }
     }
@@ -597,7 +586,6 @@ impl Give {
     /// replaces the active tab, or opens in a new tab after it with `new_tab`.
     /// Returns whether the shown file changed.
     fn show_file(&mut self, path: PathBuf, new_tab: bool) -> bool {
-        self.preview_closed = false;
         if self.selected.as_ref() == Some(&path) {
             return false;
         }
@@ -648,7 +636,6 @@ impl Give {
             return;
         }
         self.selected = None;
-        self.preview_closed = true;
         self.preview_request += 1;
         self.preview_loading = false;
         self.reset_preview_position();
@@ -737,7 +724,6 @@ impl Give {
                         ));
                         this.remember_project(repo.root.clone(), cx);
                         this.repo = Some(repo);
-                        this.activate_project_terminal(window, cx);
                         this.cache = PreviewCache::default();
                         this.prefetching.clear();
                         this.syntax_pending.clear();
@@ -746,7 +732,7 @@ impl Give {
                         this.snapshot = snapshot;
                         this.selected = None;
                         this.tabs.clear();
-                        this.preview_closed = false;
+                        this.terminal_visible = true;
                         this.tree.clear();
                         this.tree_cursor = None;
                         this.collapsed.clear();
@@ -764,6 +750,7 @@ impl Give {
                         this.review_error = None;
                         this.close_picker(window, cx);
                         this.reset_preview_position();
+                        this.activate_project_terminal(window, cx);
                         this.notice = "Watching local changes".into();
                         if let Some(branch) = this.pending_review.take() {
                             this.start_review(branch, window, cx);
@@ -1419,10 +1406,14 @@ impl Give {
             }
             repo.snapshot_with(catalog)
         });
-        self.finish_operation(task, "Index updated", false, window, cx);
+        self.finish_operation(task, "Index updated", window, cx);
     }
 
     fn commit(&mut self, _: &Commit, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_changes(false, window, cx);
+    }
+
+    fn commit_changes(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy || self.opening || self.review_branch.is_some() {
             return;
         }
@@ -1440,13 +1431,57 @@ impl Give {
         if !self.snapshot.files.iter().any(ChangedFile::staged) {
             return;
         }
-        self.start_operation("Committing staged changes…", cx);
+        self.start_operation(
+            if push {
+                "Committing and pushing…"
+            } else {
+                "Committing…"
+            },
+            cx,
+        );
         let catalog = self.catalog();
         let task = cx.background_executor().spawn(async move {
-            repo.commit(&message)?;
-            repo.snapshot_with(catalog)
+            let result = if push {
+                branches::commit_and_push(&repo, &message).map(Some)
+            } else {
+                repo.commit(&message).map(|()| None)
+            };
+            (result, repo.snapshot_with(catalog))
         });
-        self.finish_operation(task, "Commit created", true, window, cx);
+        cx.spawn_in(window, async move |view, cx| {
+            let (result, snapshot) = task.await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                let mut errors = Vec::new();
+                match result {
+                    Ok(outcome) => {
+                        this.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
+                        match outcome {
+                            None => this.notice = "Commit created".into(),
+                            Some(branches::CommitPushOutcome::Pushed(message)) => {
+                                this.notice = format!("Commit created · {message}");
+                            }
+                            Some(branches::CommitPushOutcome::PushFailed(error)) => {
+                                errors.push(format!("Commit created locally, but push failed: {error}\nRetry with ‘Push…’ in the branch menu."));
+                            }
+                        }
+                    }
+                    Err(error) => errors.push(format!("{error:#}")),
+                }
+                match snapshot {
+                    Ok(snapshot) => {
+                        this.cache.retain_versions(&snapshot.versions);
+                        this.snapshot = snapshot;
+                        this.rebuild_tree(false, cx);
+                    }
+                    Err(error) => errors.push(format!("Refresh failed: {error:#}")),
+                }
+                if !errors.is_empty() {
+                    this.show_error(errors.join("\n"), cx);
+                }
+                cx.notify();
+            });
+        }).detach();
     }
 
     fn start_operation(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -1467,22 +1502,17 @@ impl Give {
         &mut self,
         task: Task<anyhow::Result<Snapshot>>,
         message: &'static str,
-        clear_message: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
-            let _ = view.update_in(cx, |this, window, cx| {
+            let _ = view.update_in(cx, |this, _, cx| {
                 this.busy = false;
                 match result {
                     Ok(snapshot) => {
                         this.snapshot = snapshot;
                         this.notice = message.into();
-                        if clear_message {
-                            this.commit_input
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                        }
                         this.rebuild_tree(false, cx);
                     }
                     Err(error) => {
@@ -1528,7 +1558,8 @@ impl Give {
         self.collapsed.clear();
         self.selected = None;
         self.tabs.clear();
-        self.preview_closed = false;
+        self.terminal_visible = true;
+        self.activate_project_terminal(window, cx);
         self.reset_preview_position();
         self.focus_left = true;
         self.notice = format!("Reviewing {branch}…");
@@ -2274,6 +2305,9 @@ impl Give {
     }
 
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo.is_some() && self.selected.is_none() {
+            return;
+        }
         self.terminal_visible = !self.terminal_visible;
         self.activate_project_terminal(window, cx);
         if !self.terminal_visible {
@@ -2637,9 +2671,20 @@ impl Give {
                             } else {
                                 0x151e28
                             }))
+                            .when(self.repo.is_some() && self.selected.is_none(), |el| {
+                                el.opacity(0.5)
+                            })
                             .hover(|el| el.bg(rgb(SURFACE)))
-                            .tooltip(|window, cx| {
-                                Tooltip::new("Toggle right terminal · ⌘2").build(window, cx)
+                            .tooltip({
+                                let can_hide = self.repo.is_none() || self.selected.is_some();
+                                move |window, cx| {
+                                    Tooltip::new(if can_hide {
+                                        "Toggle right terminal · ⌘2"
+                                    } else {
+                                        "Open a file to hide the terminal"
+                                    })
+                                    .build(window, cx)
+                                }
                             })
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -3089,7 +3134,7 @@ impl Give {
                     div()
                         .border_t_1()
                         .border_color(rgb(BORDER))
-                        .p_2()
+                        .p_1p5()
                         .child(
                             Button::new("commit-toggle")
                                 .ghost()
@@ -3109,21 +3154,32 @@ impl Give {
                                     .flex_col()
                                     .gap_2()
                                     .child(
-                                        Input::new(&self.commit_input).small().disabled(self.busy),
+                                        Input::new(&self.commit_input).small().disabled(self.busy || self.opening),
                                     )
                                     .child(
-                                        Button::new("commit")
+                                        DropdownButton::new("commit-actions")
                                             .primary()
                                             .small()
-                                            .label(if self.busy {
-                                                "Working…"
-                                            } else {
-                                                "Commit staged changes"
-                                            })
+                                            .w_full()
                                             .disabled(!can_commit)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.commit(&Commit, window, cx)
-                                            })),
+                                            .button(
+                                                Button::new("commit")
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .label(if self.busy { "Working…" } else { "Commit" })
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.commit(&Commit, window, cx)
+                                                    })),
+                                            )
+                                            .dropdown_menu_with_anchor(Corner::BottomRight, {
+                                                let view = cx.entity().downgrade();
+                                                move |menu, _, _| {
+                                                    let view = view.clone();
+                                                    menu.item(PopupMenuItem::new("Commit + Push").on_click(move |_, window, cx| {
+                                                        let _ = view.update(cx, |this, cx| this.commit_changes(true, window, cx));
+                                                    }))
+                                                }
+                                            }),
                                     ),
                             )
                         }),
@@ -4420,6 +4476,11 @@ impl Give {
 
 impl Render for Give {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The last tab can also disappear during a background refresh.
+        if self.repo.is_some() && self.selected.is_none() && !self.terminal_visible {
+            self.terminal_visible = true;
+            self.activate_project_terminal(window, cx);
+        }
         let history_target = if self.review_branch.is_some() && self.review.is_none() {
             None
         } else {
@@ -4535,7 +4596,7 @@ impl Render for Give {
                     .overflow_hidden()
                     .when(self.repo.is_some(), |el| {
                         el.when(self.sidebar_visible, |el| el.child(self.sidebar(cx)))
-                            .when(self.selected.is_some() || !self.terminal_visible, |el| {
+                            .when(self.selected.is_some(), |el| {
                                 el.child(self.preview(window, cx))
                             })
                     })
@@ -4574,7 +4635,7 @@ impl Render for Give {
                         .cursor_pointer().rounded_sm()
                         .bg(rgb(if self.history_visible { SURFACE } else { PANEL }))
                         .hover(|el| el.bg(rgb(SURFACE)))
-                        .tooltip(|window, cx| Tooltip::new("Git history · ⌘3").build(window, cx))
+                        .tooltip(|window, cx| Tooltip::new("Git history").build(window, cx))
                         .on_click(cx.listener(|this, _, window, cx| this.toggle_history(&ToggleHistory, window, cx)))
                         .child(ui_icon("history", 13., if self.history_visible { ACCENT } else { MUTED }))
                         .child("Git"))
@@ -4590,6 +4651,7 @@ impl Render for Give {
                     ),
             )
             .when(self.picker_open, |el| el.child(self.branch_picker(window, cx)))
+            .children(gpui_component::Root::render_dialog_layer(window, cx))
     }
 }
 
@@ -4706,4 +4768,67 @@ fn ui_icon(name: &'static str, side: f32, color: u32) -> impl IntoElement {
         .size(px(side))
         .flex_shrink_0()
         .text_color(rgb(color))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_component::{Root, WindowExt};
+    // The GPUI glob also exports a `test` macro; the generated attribute needs Rust's.
+    use std::prelude::v1::test;
+
+    #[gpui::test]
+    fn quick_terminal_button_displays_modal(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::terminal_view::init(cx);
+            crate::find_view::init(cx);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| Give::new(None, None, window, cx));
+            view.update(cx, |view, cx| {
+                view.repo = Some(Repository {
+                    root: directory.path().to_owned(),
+                });
+                view.terminal_visible = true;
+                view.activate_project_terminal(window, cx);
+            });
+            Root::new(view, window, cx)
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("quick-terminal-launcher")
+            .expect("terminal launcher is rendered");
+        let main_focus = cx.update(|window, cx| window.focused(cx));
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "click opens a dialog"
+        );
+        let modal = cx
+            .debug_bounds("quick-terminal-content")
+            .expect("quick terminal modal must be rendered after clicking its launcher");
+        assert!(modal.size.width > px(400.) && modal.size.height > px(200.));
+        assert_ne!(cx.update(|window, cx| window.focused(cx)), main_focus);
+
+        cx.simulate_keystrokes("enter escape");
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.simulate_keystrokes("cmd-w");
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), main_focus);
+
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.debug_bounds("quick-terminal-content").is_some());
+        cx.simulate_click(point(px(20.), px(100.)), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), main_focus);
+    }
 }

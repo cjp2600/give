@@ -36,6 +36,9 @@ impl AssetSource for Assets {
                 "../assets/ui/chevron-down.svg"
             ))),
             "icons/search.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/search.svg"))),
+            "icons/terminal.svg" => {
+                Some(Cow::Borrowed(include_bytes!("../assets/ui/terminal.svg")))
+            }
             "icons/config.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/config.svg"))),
             "icons/markdown.svg" => {
                 Some(Cow::Borrowed(include_bytes!("../assets/ui/markdown.svg")))
@@ -57,6 +60,7 @@ impl AssetSource for Assets {
             "icons/chevron-right.svg",
             "icons/chevron-down.svg",
             "icons/search.svg",
+            "icons/terminal.svg",
             "icons/config.svg",
             "icons/markdown.svg",
         ]
@@ -218,7 +222,6 @@ fn main() {
                 KeyBinding::new("secondary-2", ToggleTerminal, Some("Give")),
                 KeyBinding::new("secondary-b", ToggleTerminal, Some("Give")),
                 KeyBinding::new("secondary-1", ToggleSidebar, Some("Give")),
-                KeyBinding::new("secondary-3", ToggleHistory, Some("Give")),
                 KeyBinding::new(
                     "secondary-w",
                     ClosePreview,

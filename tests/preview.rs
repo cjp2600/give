@@ -248,6 +248,116 @@ fn dart_has_its_own_grammar() {
 }
 
 #[test]
+fn proto3_highlights_declarations_fields_rpcs_and_literals() {
+    let cases = [
+        (
+            "syntax = \"proto3\";",
+            vec![("syntax", 0xb49adb), ("proto3", 0x9fbea8)],
+        ),
+        (
+            "import public 'common.proto';",
+            vec![
+                ("import", 0xb49adb),
+                ("public", 0xb49adb),
+                ("common.proto", 0x9fbea8),
+            ],
+        ),
+        ("package example.v1;", vec![("package", 0xb49adb)]),
+        (
+            "message Request {",
+            vec![("message", 0xb49adb), ("Request", 0x8db5d0)],
+        ),
+        (
+            "  optional string name = 1; // имя",
+            vec![
+                ("optional", 0xb49adb),
+                ("string", 0xb49adb),
+                ("1", 0xd6bb85),
+                ("имя", 0x74879c),
+            ],
+        ),
+        (
+            "  repeated .example.v1.Item items = 2;",
+            vec![
+                ("repeated", 0xb49adb),
+                ("example.v1.Item", 0x8db5d0),
+                ("2", 0xd6bb85),
+            ],
+        ),
+        (
+            "  map<string, bytes> labels = 3;",
+            vec![
+                ("map", 0xb49adb),
+                ("string", 0xb49adb),
+                ("bytes", 0xb49adb),
+                ("3", 0xd6bb85),
+            ],
+        ),
+        ("  oneof payload {", vec![("oneof", 0xb49adb)]),
+        (
+            "  reserved 4 to 9;",
+            vec![("reserved", 0xb49adb), ("to", 0xb49adb), ("9", 0xd6bb85)],
+        ),
+        (
+            "enum State { UNKNOWN = 0; }",
+            vec![("enum", 0xb49adb), ("0", 0xd6bb85)],
+        ),
+        ("service API {", vec![("service", 0xb49adb)]),
+        (
+            "  rpc Watch(stream Request) returns (stream Reply);",
+            vec![
+                ("rpc", 0xb49adb),
+                ("Watch", 0x8cb5d6),
+                ("stream", 0xb49adb),
+                ("returns", 0xb49adb),
+            ],
+        ),
+        (
+            "option deprecated = true;",
+            vec![("option", 0xb49adb), ("true", 0xd6bb85)],
+        ),
+        (
+            "option (custom.ratio) = -1.5e+2;",
+            vec![("1.5e+2", 0xd6bb85)],
+        ),
+        (
+            "/* message hidden = 42; */ int32 count = 5;",
+            vec![
+                ("hidden", 0x74879c),
+                ("42", 0x74879c),
+                ("int32", 0xb49adb),
+                ("5;", 0xd6bb85),
+            ],
+        ),
+        (
+            r#"option (custom.text) = "say \"hi\" // message";"#,
+            vec![("say", 0x9fbea8), ("// message", 0x9fbea8)],
+        ),
+    ];
+    let source = cases
+        .iter()
+        .map(|(line, _)| *line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rows = preview::full_context(source.as_bytes());
+    let styles = preview::highlight(Path::new("api/service.proto"), &rows);
+    assert_eq!(styles.len(), cases.len());
+    for ((line, tokens), spans) in cases.iter().zip(&styles) {
+        for span in spans {
+            assert!(line.get(span.range.clone()).is_some(), "{line}");
+        }
+        for (token, expected) in tokens {
+            let start = line.find(token).unwrap();
+            let span = spans
+                .iter()
+                .find(|span| span.range.contains(&start))
+                .unwrap();
+            assert_eq!(span.color, *expected, "{token} in {line}");
+        }
+    }
+}
+
+#[test]
 fn overlay_matches_thirty_cases_exported_from_original_go_renderer() {
     let cases: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/giv-preview.json")).unwrap();

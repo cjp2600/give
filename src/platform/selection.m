@@ -93,7 +93,7 @@ void give_selection_update(void *rawView, unsigned index, const char *label,
     NSMutableArray *nodes = objc_getAssociatedObject(view, &nodesKey);
     if (!nodes) {
         nodes = [NSMutableArray array];
-        for (unsigned n = 0; n < 2; ++n) {
+        for (unsigned n = 0; n < 3; ++n) {
             GiveTextElement *node = [GiveTextElement new];
             node.owner = view; node.text = @""; node.selection = @"";
             node.accessibilityElement = YES;

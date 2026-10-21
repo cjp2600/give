@@ -28,6 +28,14 @@ static EXTRA_SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(|| {
         )
         .expect("bundled Dart grammar"),
     );
+    builder.add(
+        SyntaxDefinition::load_from_str(
+            include_str!("../assets/syntaxes/Protobuf.sublime-syntax"),
+            false,
+            None,
+        )
+        .expect("bundled Protocol Buffers grammar"),
+    );
     builder.build()
 });
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
