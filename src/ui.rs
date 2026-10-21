@@ -1,8 +1,9 @@
 use crate::{
     ActivateRow, ClosePreview, CollapseRow, Commit, CopyDiff, CopyPath, ExitReview, ExpandRow,
-    Find, FirstRow, LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerCancel,
-    PickerDown, PickerUp, PreviousFile, Refresh, ReviewBranch, SelectAllText, SelectDown,
-    SelectLeft, SelectRight, SelectUp, SwitchPane, ToggleDeletions, ToggleSidebar, ToggleTerminal,
+    Find, FirstRow, LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerAccept,
+    PickerBack, PickerCancel, PickerDown, PickerOpenActions, PickerUp, PreviousFile, Refresh,
+    ReviewBranch, SelectAllText, SelectDown, SelectLeft, SelectRight, SelectUp, SwitchPane,
+    ToggleDeletions, ToggleHistory, ToggleSidebar, ToggleTerminal,
 };
 use give::{
     branches,
@@ -67,6 +68,9 @@ impl TreeMode {
 }
 const TREE_HEIGHT: f32 = 27.;
 
+#[path = "history_view.rs"]
+mod history_view;
+
 pub struct Give {
     repo: Option<Repository>,
     accessibility: crate::accessibility::Text,
@@ -80,6 +84,10 @@ pub struct Give {
     sidebar_visible: bool,
     sidebar_width: f32,
     sidebar_dragging: bool,
+    history: Entity<history_view::HistoryPanel>,
+    history_visible: bool,
+    history_height: f32,
+    history_dragging: bool,
     /// What the open context menu's "Copy path" copies, set by the right-clicked row.
     context_copy: Option<ContextCopy>,
     snapshot: Snapshot,
@@ -157,6 +165,10 @@ pub struct Give {
     picker_open: bool,
     picker_mode: BranchPickerMode,
     branch_button_bounds: Rc<Cell<Bounds<Pixels>>>,
+    branch_panel_bounds: Rc<Cell<Bounds<Pixels>>>,
+    branch_row_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    branch_menu: Option<BranchMenu>,
+    branch_menu_focus: FocusHandle,
     picker_request: u64,
     picker_note: Option<String>,
     branches: Vec<Branch>,
@@ -212,9 +224,24 @@ enum PickerRow {
 enum BranchPickerMode {
     Review,
     Switch,
-    Merge,
     PullFrom,
     Push,
+}
+
+#[derive(Clone, Copy)]
+enum BranchAction {
+    Checkout,
+    Review,
+    Merge,
+    Pull,
+    PullFrom,
+    Push,
+}
+
+struct BranchMenu {
+    branch: Branch,
+    actions: Vec<BranchAction>,
+    cursor: usize,
 }
 
 enum BranchOperation {
@@ -271,6 +298,7 @@ impl Give {
                     InputEvent::Change => {
                         this.branch_query = input.read(cx).value().trim().to_owned();
                         this.branch_cursor = 0;
+                        this.branch_menu = None;
                         this.branch_scroll.scroll_to_item(0, ScrollStrategy::Top);
                         cx.notify();
                     }
@@ -294,6 +322,10 @@ impl Give {
             sidebar_visible: true,
             sidebar_width: 270.,
             sidebar_dragging: false,
+            history: cx.new(history_view::HistoryPanel::new),
+            history_visible: false,
+            history_height: 300.,
+            history_dragging: false,
             context_copy: None,
             snapshot: Snapshot::default(),
             tree: Vec::new(),
@@ -359,6 +391,10 @@ impl Give {
             picker_open: false,
             picker_mode: BranchPickerMode::Review,
             branch_button_bounds: Rc::new(Cell::new(Bounds::default())),
+            branch_panel_bounds: Rc::new(Cell::new(Bounds::default())),
+            branch_row_bounds: Rc::default(),
+            branch_menu: None,
+            branch_menu_focus: cx.focus_handle(),
             picker_request: 0,
             picker_note: None,
             branches: Vec::new(),
@@ -1588,6 +1624,8 @@ impl Give {
         }
         self.picker_open = true;
         self.picker_mode = mode;
+        self.branch_menu = None;
+        self.branch_row_bounds.borrow_mut().clear();
         self.picker_note = None;
         self.branches.clear();
         self.branch_remotes.clear();
@@ -1673,6 +1711,7 @@ impl Give {
             return;
         }
         self.picker_open = false;
+        self.branch_menu = None;
         self.picker_request += 1;
         self.branches_loading = false;
         self.focus.focus(window);
@@ -1697,7 +1736,6 @@ impl Give {
             .enumerate()
             .filter(|(_, branch)| branch.name.to_lowercase().contains(&query))
             .filter(|(_, branch)| match self.picker_mode {
-                BranchPickerMode::Merge => !branch.current,
                 BranchPickerMode::PullFrom => branch.remote.is_some(),
                 _ => true,
             })
@@ -1735,13 +1773,15 @@ impl Give {
         }
         let rows = self.picker_rows();
         let row = rows.get(self.branch_cursor.min(rows.len().saturating_sub(1)));
+        if self.picker_mode == BranchPickerMode::Switch {
+            self.open_branch_actions(window, cx);
+            return;
+        }
         if self.picker_mode != BranchPickerMode::Review {
             let operation = match row {
                 Some(PickerRow::Branch(index)) => {
                     let branch = self.branches[*index].clone();
                     match self.picker_mode {
-                        BranchPickerMode::Switch => BranchOperation::Switch(branch),
-                        BranchPickerMode::Merge => BranchOperation::Merge(branch),
                         BranchPickerMode::PullFrom => BranchOperation::PullFrom(branch),
                         _ => return,
                     }
@@ -1761,6 +1801,95 @@ impl Give {
             None => return,
         };
         self.start_review(branch, window, cx);
+    }
+
+    fn open_branch_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker_mode != BranchPickerMode::Switch
+            || self.busy
+            || self.opening
+            || self.review_step.is_some()
+        {
+            return;
+        }
+        let Some(PickerRow::Branch(index)) = self.picker_rows().get(self.branch_cursor).copied()
+        else {
+            return;
+        };
+        let branch = self.branches[index].clone();
+        let mut actions = Vec::new();
+        if !branch.current {
+            actions.push(BranchAction::Checkout);
+        }
+        actions.push(BranchAction::Review);
+        if self.review_branch.is_none() {
+            if branch.current {
+                actions.extend([
+                    BranchAction::Pull,
+                    BranchAction::PullFrom,
+                    BranchAction::Push,
+                ]);
+            } else {
+                actions.push(BranchAction::Merge);
+                if branch.remote.is_some() {
+                    actions.push(BranchAction::PullFrom);
+                }
+            }
+        }
+        self.branch_menu = Some(BranchMenu {
+            branch,
+            actions,
+            cursor: 0,
+        });
+        self.branch_menu_focus.focus(window);
+        cx.notify();
+    }
+
+    fn close_branch_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.branch_menu = None;
+        self.branch_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn move_branch_action(&mut self, offset: isize, cx: &mut Context<Self>) {
+        if let Some(menu) = &mut self.branch_menu {
+            menu.cursor = menu
+                .cursor
+                .saturating_add_signed(offset)
+                .min(menu.actions.len() - 1);
+            cx.notify();
+        }
+    }
+
+    fn run_branch_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.opening || self.review_step.is_some() {
+            return;
+        }
+        let Some(menu) = self.branch_menu.take() else {
+            return;
+        };
+        let branch = menu.branch;
+        let operation = match menu.actions[menu.cursor] {
+            BranchAction::Checkout => BranchOperation::Switch(branch),
+            BranchAction::Review => {
+                self.start_review(branch.name, window, cx);
+                return;
+            }
+            BranchAction::Merge => BranchOperation::Merge(branch),
+            BranchAction::Pull => BranchOperation::Pull,
+            BranchAction::PullFrom if branch.remote.is_some() => BranchOperation::PullFrom(branch),
+            BranchAction::PullFrom => {
+                self.show_branch_picker(BranchPickerMode::PullFrom, window, cx);
+                return;
+            }
+            BranchAction::Push => {
+                self.show_branch_picker(BranchPickerMode::Push, window, cx);
+                return;
+            }
+        };
+        self.branch_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        self.branch_operation(operation, window, cx);
     }
 
     fn branch_operation(
@@ -1783,6 +1912,10 @@ impl Give {
         let Some(repo) = self.repo.clone() else {
             return;
         };
+        if self.branch_menu.take().is_some() {
+            self.branch_input
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
         let fetching = matches!(operation, BranchOperation::Fetch);
         let reviewing = self.review_branch.is_some();
         let message = match &operation {
@@ -2149,6 +2282,16 @@ impl Give {
         cx.notify();
     }
 
+    fn toggle_history(&mut self, _: &ToggleHistory, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            return;
+        }
+        self.history_visible = !self.history_visible;
+        self.history_dragging = false;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_visible = !self.sidebar_visible;
         self.sidebar_dragging = false;
@@ -2326,7 +2469,14 @@ impl Give {
     }
 
     fn drag_ui(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_dragging {
+        if self.history_dragging {
+            self.history_height =
+                (f32::from(window.viewport_size().height - event.position.y) - 25.).clamp(
+                    150.,
+                    (f32::from(window.viewport_size().height) - 180.).max(150.),
+                );
+            cx.notify();
+        } else if self.sidebar_dragging {
             self.sidebar_width = f32::from(event.position.x).clamp(
                 180.,
                 (f32::from(window.viewport_size().width) * 0.6).max(180.),
@@ -3764,21 +3914,15 @@ impl Give {
         let title = match self.picker_mode {
             BranchPickerMode::Switch => "Branches".to_owned(),
             BranchPickerMode::Review => "Review branch".to_owned(),
-            BranchPickerMode::Merge => format!("Merge a branch → {}", self.snapshot.branch),
             BranchPickerMode::PullFrom => {
                 format!("Pull a remote branch → {}", self.snapshot.branch)
             }
             BranchPickerMode::Push => format!("Push {} → remote", self.snapshot.branch),
         };
         let hint = match self.picker_mode {
-            BranchPickerMode::Switch => {
-                "Choose a local branch or check out a remote branch with tracking."
-            }
+            BranchPickerMode::Switch => "Select a branch to see its available actions.",
             BranchPickerMode::Review => {
                 "Fetches all remotes, then compares with the open GitLab MR or the merge-base with main."
-            }
-            BranchPickerMode::Merge => {
-                "Choose the source branch to merge into the current branch. Conflicts will be shown here."
             }
             BranchPickerMode::PullFrom => {
                 "Choose the remote source. Fast-forward only; saves upstream tracking after success."
@@ -3788,188 +3932,197 @@ impl Give {
             }
         };
         let keys = match self.picker_mode {
-            BranchPickerMode::Switch => "↑↓ choose · Enter switch · Esc close",
+            BranchPickerMode::Switch => "↑↓ choose · Enter / → actions · Esc close",
             BranchPickerMode::Review => "↑↓ choose · Enter review · Esc close",
-            BranchPickerMode::Merge => "↑↓ choose · Enter merge · Esc close",
             BranchPickerMode::PullFrom => "↑↓ choose · Enter pull · Esc close",
             BranchPickerMode::Push => "↑↓ choose · Enter push · Esc close",
         };
+        let panel_bounds = self.branch_panel_bounds.clone();
         let panel = div()
-                    .key_context("BranchPicker")
-                    .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.move_picker(-1, cx)))
-                    .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.move_picker(1, cx)))
-                    .on_action(cx.listener(|this, _: &PickerCancel, window, cx| {
-                        this.close_picker(window, cx)
-                    }))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .w(px(560.))
-                    .h_auto()
+            .relative()
+            .key_context("BranchPicker")
+            .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.move_picker(-1, cx)))
+            .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.move_picker(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &PickerCancel, window, cx| this.close_picker(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &PickerOpenActions, window, cx| {
+                this.open_branch_actions(window, cx)
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .w(px(if switching { 440. } else { 560. }))
+            .h_auto()
+            .flex()
+            .flex_col()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(0x35495f))
+            .rounded(px(8.))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_4()
+                    .pt_3()
+                    .pb_2()
                     .flex()
                     .flex_col()
-                    .bg(rgb(PANEL))
-                    .border_1()
-                    .border_color(rgb(0x35495f))
-                    .rounded(px(8.))
-                    .shadow_lg()
-                    .overflow_hidden()
+                    .gap_1()
                     .child(
                         div()
-                            .px_4()
-                            .pt_3()
-                            .pb_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(title),
-                            )
-                            .child(
-                                div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                                    hint,
-                                ),
-                            ),
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
                     )
-                    .when(switching, |el| el.child(
-                        div().px_3().pb_2().flex().flex_wrap().gap_2()
-                            .child(Button::new("fetch-branches").ghost().xsmall()
+                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(hint)),
+            )
+            .when(switching, |el| {
+                el.child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("fetch-branches")
+                                .ghost()
+                                .xsmall()
                                 .label("Fetch all remotes")
-                                .disabled(self.busy || self.branches_loading || self.review_step.is_some())
+                                .disabled(
+                                    self.busy
+                                        || self.branches_loading
+                                        || self.review_step.is_some(),
+                                )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.branch_operation(BranchOperation::Fetch, window, cx)
-                                })))
-                            .child(Button::new("pull-branch").ghost().xsmall()
-                                .label("Pull current branch")
-                                .tooltip("Update the checked-out branch from its upstream · fast-forward only")
-                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.branch_operation(BranchOperation::Pull, window, cx)
-                                })))
-                            .child(Button::new("pull-from").ghost().xsmall()
-                                .label("Pull from…")
-                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.show_branch_picker(BranchPickerMode::PullFrom, window, cx)
-                                })))
-                            .child(Button::new("push-branch").ghost().xsmall()
-                                .label("Push current branch…")
-                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.show_branch_picker(BranchPickerMode::Push, window, cx)
-                                })))
-                            .child(Button::new("merge-branch").ghost().xsmall()
-                                .label("Merge into current…")
-                                .disabled(self.busy || self.branches_loading || self.review_branch.is_some())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.show_branch_picker(BranchPickerMode::Merge, window, cx)
-                                })))
-                            .child(Button::new("abort-merge").ghost().xsmall()
+                                })),
+                        )
+                        .child(
+                            Button::new("abort-merge")
+                                .ghost()
+                                .xsmall()
                                 .label("Abort merge")
                                 .disabled(self.busy || self.review_branch.is_some())
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.branch_operation(BranchOperation::AbortMerge, window, cx)
-                                })))
-                    ))
-                    .when(working && !switching, |el| el.child(
-                        div().px_3().pb_2().flex().gap_2().child(Button::new("back-to-branches").ghost().xsmall()
+                                })),
+                        ),
+                )
+            })
+            .when(working && !switching, |el| {
+                el.child(
+                    div().px_3().pb_2().flex().gap_2().child(
+                        Button::new("back-to-branches")
+                            .ghost()
+                            .xsmall()
                             .label("Back to branches")
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_branch_picker(BranchPickerMode::Switch, window, cx)
-                            })))
-                            .when(self.picker_mode == BranchPickerMode::Merge, |el| el.child(
-                                Button::new("abort-current-merge").ghost().xsmall()
-                                    .label("Abort merge")
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.branch_operation(BranchOperation::AbortMerge, window, cx)
-                                    }))))
-                    ))
-                    .child(
-                        div().px_3().pb_2().child(
-                            Input::new(&self.branch_input)
-                                .small()
-                                .prefix(ui_icon("branch", 13., MUTED)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .border_t_1()
-                            .border_color(rgb(BORDER))
-                            .h(px(height))
-                            .when(rows.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .h_full()
-                                        .px_4()
-                                        .flex()
-                                        .items_center()
-                                        .text_color(rgb(MUTED))
-                                        .child(if self.branches_loading {
-                                            "Loading branches…"
-                                        } else if self.picker_mode == BranchPickerMode::Push {
-                                            "No remotes. Configure a Git remote first."
-                                        } else {
-                                            "No matching branches. Clear the filter or fetch remotes."
-                                        }),
-                                )
-                            })
-                            .when(!rows.is_empty(), |el| {
-                                el.child(
-                                    uniform_list(
-                                        "branches",
-                                        rows.len(),
-                                        cx.processor(
-                                            |this, range: std::ops::Range<usize>, _, cx| {
-                                                let rows = this.picker_rows();
-                                                range
-                                                    .filter_map(|index| {
-                                                        let row = *rows.get(index)?;
-                                                        Some(this.picker_row(index, row, cx))
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                            },
-                                        ),
-                                    )
-                                    .track_scroll(self.branch_scroll.clone())
-                                    .h_full(),
-                                )
-                            }),
-                    )
-                    .when_some(self.picker_note.as_ref(), |el, note| {
-                        el.child(div().id("branch-operation-error").max_h(px(120.)).overflow_y_scroll()
-                            .px_4().py_2().text_size(px(11.)).text_color(rgb(RED))
-                            .child(note.chars().take(1800).collect::<String>()))
+                            })),
+                    ),
+                )
+            })
+            .child(
+                div().px_3().pb_2().child(
+                    Input::new(&self.branch_input)
+                        .small()
+                        .prefix(ui_icon("branch", 13., MUTED)),
+                ),
+            )
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .h(px(height))
+                    .when(rows.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .h_full()
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .text_color(rgb(MUTED))
+                                .child(if self.branches_loading {
+                                    "Loading branches…"
+                                } else if self.picker_mode == BranchPickerMode::Push {
+                                    "No remotes. Configure a Git remote first."
+                                } else {
+                                    "No matching branches. Clear the filter or fetch remotes."
+                                }),
+                        )
                     })
-                    .child(
-                        div()
-                            .h(px(28.))
-                            .px_4()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .border_t_1()
-                            .border_color(rgb(BORDER))
-                            .text_size(px(10.))
-                            .text_color(rgb(MUTED))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(if self.busy {
-                                        self.notice.clone()
-                                    } else if self.branches_loading {
-                                        "Loading branches…".to_owned()
-                                    } else {
-                                        format!("{} {}", rows.len(), if self.picker_mode == BranchPickerMode::Push { "remotes" } else { "branches" })
-                                    }),
+                    .when(!rows.is_empty(), |el| {
+                        el.child(
+                            uniform_list(
+                                "branches",
+                                rows.len(),
+                                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                    let rows = this.picker_rows();
+                                    range
+                                        .filter_map(|index| {
+                                            let row = *rows.get(index)?;
+                                            Some(this.picker_row(index, row, cx))
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
                             )
-                            .child(keys),
-                    );
+                            .track_scroll(self.branch_scroll.clone())
+                            .h_full(),
+                        )
+                    }),
+            )
+            .when_some(self.picker_note.as_ref(), |el, note| {
+                el.child(
+                    div()
+                        .id("branch-operation-error")
+                        .max_h(px(120.))
+                        .overflow_y_scroll()
+                        .px_4()
+                        .py_2()
+                        .text_size(px(11.))
+                        .text_color(rgb(RED))
+                        .child(note.chars().take(1800).collect::<String>()),
+                )
+            })
+            .child(
+                div()
+                    .h(px(28.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(div().flex_1().min_w_0().truncate().child(if self.busy {
+                        self.notice.clone()
+                    } else if self.branches_loading {
+                        "Loading branches…".to_owned()
+                    } else {
+                        format!(
+                            "{} {}",
+                            rows.len(),
+                            if self.picker_mode == BranchPickerMode::Push {
+                                "remotes"
+                            } else {
+                                "branches"
+                            }
+                        )
+                    }))
+                    .child(keys),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, _| panel_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
 
         let backdrop = div()
             .id("branch-picker-backdrop")
@@ -3982,11 +4135,28 @@ impl Give {
             );
         if working {
             let bounds = self.branch_button_bounds.get();
+            let mut group = div().flex().items_start().gap_1().child(panel);
+            if let Some(menu) = &self.branch_menu {
+                let panel_bounds = self.branch_panel_bounds.get();
+                let row_bounds = self
+                    .branch_row_bounds
+                    .borrow()
+                    .get(&self.branch_cursor)
+                    .copied();
+                let offset = row_bounds
+                    .map(|row| row.top() - panel_bounds.top())
+                    .unwrap_or(px(0.));
+                let menu_height = px(70. + menu.actions.len() as f32 * 32.);
+                let offset = offset
+                    .max(px(0.))
+                    .min((panel_bounds.size.height - menu_height).max(px(0.)));
+                group = group.child(div().mt(offset).child(self.branch_actions_menu(menu, cx)));
+            }
             backdrop.child(
                 anchored()
                     .position(point(bounds.left(), bounds.bottom() + px(4.)))
                     .snap_to_window_with_margin(px(8.))
-                    .child(panel),
+                    .child(group),
             )
         } else {
             backdrop
@@ -4000,6 +4170,7 @@ impl Give {
 
     fn picker_row(&self, index: usize, row: PickerRow, cx: &mut Context<Self>) -> Stateful<Div> {
         let selected = index == self.branch_cursor;
+        let row_bounds = self.branch_row_bounds.clone();
         let (name, tag, current) = match row {
             PickerRow::Branch(i) => {
                 let branch = &self.branches[i];
@@ -4025,10 +4196,12 @@ impl Give {
         };
         div()
             .id(index)
+            .relative()
             .when(self.busy || self.review_step.is_some(), |el| {
                 el.opacity(0.55)
             })
             .h(px(30.))
+            .w_full()
             .px_4()
             .flex()
             .items_center()
@@ -4064,6 +4237,106 @@ impl Give {
             .when(!tag.is_empty(), |el| {
                 el.child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(tag))
             })
+            .when(self.picker_mode == BranchPickerMode::Switch, |el| {
+                el.child(ui_icon("chevron-right", 12., MUTED))
+            })
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        row_bounds.borrow_mut().insert(index, bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+    }
+
+    fn branch_actions_menu(&self, menu: &BranchMenu, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("branch-actions")
+            .key_context("BranchActions")
+            .track_focus(&self.branch_menu_focus)
+            .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.move_branch_action(-1, cx)))
+            .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.move_branch_action(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &PickerAccept, window, cx| {
+                    this.run_branch_action(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &PickerBack, window, cx| {
+                    this.close_branch_actions(window, cx)
+                }),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .w(px(400.))
+            .py_1()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(0x35495f))
+            .rounded(px(8.))
+            .shadow_lg()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .truncate()
+                    .child(menu.branch.name.clone()),
+            )
+            .children(menu.actions.iter().enumerate().map(|(index, action)| {
+                let label = match action {
+                    BranchAction::Checkout => {
+                        if menu.branch.remote.is_some() {
+                            "Checkout with tracking".to_owned()
+                        } else {
+                            "Checkout".to_owned()
+                        }
+                    }
+                    BranchAction::Review => "Review branch".to_owned(),
+                    BranchAction::Merge => format!("Merge into ‘{}’", self.snapshot.branch),
+                    BranchAction::Pull => "Update · pull from upstream".to_owned(),
+                    BranchAction::PullFrom if menu.branch.remote.is_some() => {
+                        format!("Pull into ‘{}’", self.snapshot.branch)
+                    }
+                    BranchAction::PullFrom => "Pull from…".to_owned(),
+                    BranchAction::Push => "Push…".to_owned(),
+                };
+                div()
+                    .id(("branch-action", index))
+                    .h(px(32.))
+                    .mx_1()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .bg(rgb(if menu.cursor == index {
+                        0x2b4057
+                    } else {
+                        PANEL
+                    }))
+                    .hover(|el| el.bg(rgb(SURFACE)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(menu) = &mut this.branch_menu {
+                            menu.cursor = index;
+                        }
+                        this.run_branch_action(window, cx);
+                    }))
+                    .child(div().truncate().child(label))
+            }))
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child("↑↓ choose · Enter run · ← / Esc back"),
+            )
     }
 
     fn welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4147,6 +4420,24 @@ impl Give {
 
 impl Render for Give {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let history_target = if self.review_branch.is_some() && self.review.is_none() {
+            None
+        } else {
+            self.repo.as_ref().map(|repo| {
+                (
+                    repo.root.clone(),
+                    self.review
+                        .as_ref()
+                        .map_or_else(|| "HEAD".to_owned(), |review| review.head.clone()),
+                    self.review_branch
+                        .clone()
+                        .unwrap_or_else(|| self.snapshot.branch.clone()),
+                )
+            })
+        };
+        self.history.update(cx, |history, cx| {
+            history.configure(history_target, self.history_visible, cx)
+        });
         if self.find.read(cx).visible
             && self
                 .find_diff
@@ -4175,6 +4466,7 @@ impl Render for Give {
                 cx.listener(|this, _, _, _| {
                     this.terminal_dragging = false;
                     this.sidebar_dragging = false;
+                    this.history_dragging = false;
                     this.preview_selecting = false;
                 }),
             )
@@ -4183,11 +4475,13 @@ impl Render for Give {
                 cx.listener(|this, _, _, _| {
                     this.terminal_dragging = false;
                     this.sidebar_dragging = false;
+                    this.history_dragging = false;
                     this.preview_selecting = false;
                 }),
             )
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_history))
             .on_action(cx.listener(Self::close_preview))
             .on_action(
                 cx.listener(|this, _: &Refresh, window, cx| this.manual_refresh(window, cx)),
@@ -4250,6 +4544,18 @@ impl Render for Give {
                         el.child(self.terminal_panel(window, cx))
                     }),
             )
+            .when(self.history_visible && self.repo.is_some(), |el| el.child(
+                div().flex().flex_col().flex_shrink_0()
+                    .h(px(self.history_height.min((f32::from(window.viewport_size().height) - 180.).max(150.))))
+                    .min_h_0().overflow_hidden()
+                    .child(div().id("history-resize").h(px(4.)).w_full().flex_shrink_0()
+                        .cursor_row_resize().bg(rgb(BORDER)).hover(|el| el.bg(rgb(ACCENT)))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.history_dragging = true;
+                            cx.stop_propagation();
+                        })))
+                    .child(div().flex_1().min_h_0().child(self.history.clone()))
+            ))
             .child(
                 div()
                     .flex()
@@ -4257,12 +4563,21 @@ impl Render for Give {
                     .justify_between()
                     .gap_4()
                     .h(px(25.))
+                    .flex_shrink_0()
                     .px_4()
                     .border_t_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(PANEL))
                     .text_size(px(10.))
                     .text_color(rgb(MUTED))
+                    .child(div().id("toggle-history").flex().items_center().gap_1().h_full().px_2()
+                        .cursor_pointer().rounded_sm()
+                        .bg(rgb(if self.history_visible { SURFACE } else { PANEL }))
+                        .hover(|el| el.bg(rgb(SURFACE)))
+                        .tooltip(|window, cx| Tooltip::new("Git history · ⌘3").build(window, cx))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_history(&ToggleHistory, window, cx)))
+                        .child(ui_icon("history", 13., if self.history_visible { ACCENT } else { MUTED }))
+                        .child("Git"))
                     .child(
                         div()
                             .flex_1()

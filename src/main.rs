@@ -28,6 +28,7 @@ impl AssetSource for Assets {
             "icons/file.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/file.svg"))),
             "icons/code.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/code.svg"))),
             "icons/branch.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/branch.svg"))),
+            "icons/history.svg" => Some(Cow::Borrowed(include_bytes!("../assets/ui/history.svg"))),
             "icons/chevron-right.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../assets/ui/chevron-right.svg"
             ))),
@@ -52,6 +53,7 @@ impl AssetSource for Assets {
             "icons/panel-left.svg",
             "icons/code.svg",
             "icons/branch.svg",
+            "icons/history.svg",
             "icons/chevron-right.svg",
             "icons/chevron-down.svg",
             "icons/search.svg",
@@ -88,6 +90,7 @@ actions!(
         ClosePreview,
         ToggleTerminal,
         ToggleSidebar,
+        ToggleHistory,
         CopyPath,
         Find,
         SelectAllText,
@@ -99,7 +102,10 @@ actions!(
         ExitReview,
         PickerUp,
         PickerDown,
-        PickerCancel
+        PickerCancel,
+        PickerOpenActions,
+        PickerBack,
+        PickerAccept
     ]
 );
 
@@ -212,6 +218,7 @@ fn main() {
                 KeyBinding::new("secondary-2", ToggleTerminal, Some("Give")),
                 KeyBinding::new("secondary-b", ToggleTerminal, Some("Give")),
                 KeyBinding::new("secondary-1", ToggleSidebar, Some("Give")),
+                KeyBinding::new("secondary-3", ToggleHistory, Some("Give")),
                 KeyBinding::new(
                     "secondary-w",
                     ClosePreview,
@@ -245,6 +252,12 @@ fn main() {
                 KeyBinding::new("up", PickerUp, Some("BranchPicker > Input")),
                 KeyBinding::new("down", PickerDown, Some("BranchPicker > Input")),
                 KeyBinding::new("escape", PickerCancel, Some("BranchPicker")),
+                KeyBinding::new("right", PickerOpenActions, Some("BranchPicker > Input")),
+                KeyBinding::new("up", PickerUp, Some("BranchActions")),
+                KeyBinding::new("down", PickerDown, Some("BranchActions")),
+                KeyBinding::new("enter", PickerAccept, Some("BranchActions")),
+                KeyBinding::new("left", PickerBack, Some("BranchActions")),
+                KeyBinding::new("escape", PickerBack, Some("BranchActions")),
             ]);
             cx.set_menus(vec![
                 Menu {
@@ -264,6 +277,7 @@ fn main() {
                     items: vec![
                         MenuItem::action("Toggle Left Sidebar", ToggleSidebar),
                         MenuItem::action("Toggle Right Terminal", ToggleTerminal),
+                        MenuItem::action("Toggle Git History", ToggleHistory),
                     ],
                 },
                 Menu {

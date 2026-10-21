@@ -1068,7 +1068,13 @@ fn paint_frame(
         let is_cursor = cursor.is_some_and(|(row, col, _)| row == cell.row && col == cell.column);
         let point = alacritty_terminal::index::Point::new(
             alacritty_terminal::index::Line(cell.row as i32 - frame.display_offset as i32),
-            alacritty_terminal::index::Column(cell.column),
+            alacritty_terminal::index::Column(
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    cell.column.saturating_sub(1)
+                } else {
+                    cell.column
+                },
+            ),
         );
         let index = matches.partition_point(|m| *m.end() < point);
         let matched = matches.get(index).is_some_and(|m| m.contains(&point));

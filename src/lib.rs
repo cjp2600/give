@@ -1,6 +1,7 @@
 pub mod branches;
 pub mod clipboard_file;
 pub mod git;
+pub mod history;
 pub mod path_reference;
 pub mod preview;
 pub mod preview_cache;
