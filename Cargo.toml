@@ -42,3 +42,6 @@ opt-level = 3
 lto = "thin"
 strip = true
 
+# GPUI 0.2.2's xattr dependency still uses a removed Linux libc alias.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
