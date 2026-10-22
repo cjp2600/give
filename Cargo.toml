@@ -2,7 +2,7 @@
 name = "give"
 version = "0.1.0"
 edition = "2024"
-description = "A native GPUI desktop version of giv"
+description = "A terminal-first IDE for product builders, built with GPUI"
 license = "MIT"
 
 [dependencies]

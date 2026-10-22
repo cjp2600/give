@@ -3,15 +3,27 @@ use std::path::{Path, PathBuf};
 
 const LIMIT: usize = 10;
 
-/// `~/Library/Application Support/give/recent.json` on macOS, the XDG config dir elsewhere.
+fn home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.map(PathBuf::from)
+}
+
+/// Recent projects in the platform's application configuration directory.
 pub fn store() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    let base = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support")
-    } else {
+    #[cfg(target_os = "macos")]
+    let base = home()?.join("Library/Application Support");
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| home().map(|home| home.join("AppData/Roaming")))?;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let base = {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"))
+            .or_else(|| home().map(|home| home.join(".config")))?
     };
     Some(base.join("give/recent.json"))
 }
@@ -48,7 +60,7 @@ pub fn remember(projects: &mut Vec<PathBuf>, project: &Path) {
 
 /// The path with the home directory shortened to `~`.
 pub fn display(path: &Path) -> String {
-    std::env::var_os("HOME")
+    home()
         .and_then(|home| path.strip_prefix(home).ok())
         .map(|rest| Path::new("~").join(rest).to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())

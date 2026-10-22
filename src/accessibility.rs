@@ -1,5 +1,6 @@
 //! Selection-reader support for macOS; it doesn't intercept the reader's hotkey.
 use gpui::{Bounds, Pixels, Window};
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 
 #[derive(Default)]
@@ -40,6 +41,8 @@ impl Text {
         bounds: Bounds<Pixels>,
         window: &Window,
     ) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = (index, label, window);
         let state = (focused, visible, bounds, self.range.clone());
         if self.sent_value && self.sent_selection && self.sent_state.as_ref() == Some(&state) {
             return;
@@ -81,10 +84,10 @@ impl Text {
                     f32::from(bounds.size.height) as f64,
                 );
             }
-            self.sent_value = true;
-            self.sent_selection = true;
-            self.sent_state = Some(state);
         }
+        self.sent_value = true;
+        self.sent_selection = true;
+        self.sent_state = Some(state);
     }
 }
 #[cfg(target_os = "macos")]
