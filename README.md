@@ -100,7 +100,7 @@ GPUI and GPUI Component are pinned to compatible published versions (`0.2.2` and
 
 ## UI direction
 
-A custom title bar keeps native macOS window controls alongside the project and branch. Deep blue surfaces, soft blue accents, a 15 px code font with 26 px line height, compact file icons and indentation guides follow the supplied editor reference. Green/red backgrounds distinguish additions/deletions. The app mark is a single flat hexagon in sky blue on a midnight-blue tile. The SVG masters and all platform exports are documented in `assets/icons/README.md`.
+An orange lowercase `give` wordmark appears in the custom title bar alongside the project and branch, and replaces the slogans on the welcome screen. The title bar reserves space for native macOS window controls only while they are shown; fullscreen and other platforms use a compact left inset. Deep blue surfaces, soft blue accents, a 15 px code font with 26 px line height, compact file icons and indentation guides follow the supplied editor reference. Green/red backgrounds distinguish additions/deletions. The app mark is a single flat hexagon in sky blue on a midnight-blue tile. The SVG masters and all platform exports are documented in `assets/icons/README.md`.
 
 Desktop selection and image-paste integration can be checked with `swift scripts/check-desktop.swift <give-executable> <temporary-repository>`; the first fixture must contain an untracked `readme.txt` with `Selection reader test` and `Русский текст для чтения`. The script starts its own process, restores the clipboard, and uses macOS Accessibility/Automation permissions. `scripts/check-selected-text.swift <pid> <expected-text>` probes a selection in an existing window.
 

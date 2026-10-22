@@ -42,6 +42,7 @@ const BORDER: u32 = 0x2a394b;
 const TEXT: u32 = 0xcbd5e1;
 const MUTED: u32 = 0x7a8da5;
 const ACCENT: u32 = 0x87b1d7;
+const BRAND_ORANGE: u32 = 0xf28c45;
 const GREEN: u32 = 0x9ac9ad;
 const RED: u32 = 0xdb929d;
 // File-name colors by change kind, as in JetBrains IDEs.
@@ -2531,15 +2532,17 @@ impl Give {
         }
     }
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let branch_bounds = self.branch_button_bounds.clone();
         let name = self
             .repo
             .as_ref()
             .and_then(|repo| repo.root.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "give".into());
+            .map(|name| name.to_string_lossy().into_owned());
         TitleBar::new()
+            // TitleBar supplies an inner 12 px inset in fullscreen; the outer
+            // traffic-light reserve is only needed in a windowed macOS window.
+            .when(window.is_fullscreen(), |bar| bar.pl_0())
             .bg(rgb(0x151e28))
             .border_color(rgb(BORDER))
             .child(
@@ -2548,7 +2551,11 @@ impl Give {
                     .items_center()
                     .gap_3()
                     .text_size(px(12.))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                    .child(brand_wordmark(14.))
+                    .when_some(name, |el, name| {
+                        el.child(div().text_color(rgb(BORDER)).child("/"))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                    })
                     .when(self.repo.is_some(), |el| {
                         el.child(div().text_color(rgb(BORDER)).child("/"))
                             .when(self.review_branch.is_some(), |el| {
@@ -3141,8 +3148,13 @@ impl Give {
                                 .small()
                                 .w_full()
                                 .label(format!("Commit · {staged} staged"))
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     this.commit_open = !this.commit_open;
+                                    if this.commit_open {
+                                        this.commit_input.update(cx, |input, cx| {
+                                            input.focus(window, cx)
+                                        });
+                                    }
                                     cx.notify();
                                 })),
                         )
@@ -4404,19 +4416,7 @@ impl Give {
             .justify_center()
             .gap_6()
             .bg(rgb(BACKGROUND))
-            .child(brand_icon(128.))
-            .child(
-                div()
-                    .text_size(px(36.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Make good changes."),
-            )
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .text_color(rgb(MUTED))
-                    .child("A quiet workspace for reviewing what you and your agents build."),
-            )
+            .child(brand_wordmark(80.))
             .child(
                 Button::new("welcome-open")
                     .primary()
@@ -4464,13 +4464,6 @@ impl Give {
                         })),
                 )
             })
-            .child(
-                div()
-                    .mt_3()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child("Review a diff  ·  Stage with intention  ·  Commit when ready"),
-            )
     }
 }
 
@@ -4587,7 +4580,7 @@ impl Render for Give {
             .text_color(rgb(TEXT))
             .font_family(".SystemUIFont")
             .text_size(px(12.))
-            .child(self.toolbar(cx))
+            .child(self.toolbar(window, cx))
             .child(
                 div()
                     .flex()
@@ -4693,6 +4686,16 @@ fn file_name_color(file: &ChangedFile) -> u32 {
     } else {
         NAME_MODIFIED
     }
+}
+
+fn brand_wordmark(size: f32) -> Div {
+    div()
+        .flex_shrink_0()
+        .text_size(px(size))
+        .line_height(relative(1.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(rgb(BRAND_ORANGE))
+        .child("give")
 }
 
 fn brand_icon(side: f32) -> impl IntoElement {
