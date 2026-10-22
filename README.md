@@ -51,16 +51,16 @@ The quick shell retains its state when you close and reopen it. Project sessions
 
 ## Get started
 
-Download a prebuilt package from the [latest release](https://github.com/cjp2600/give/releases/latest). give is in early development; Linux and Windows packages are previews.
+Download a prebuilt package from the [latest release](https://github.com/cjp2600/give/releases/latest). give is in early development; the Linux package is a preview.
 
 | Platform | Download | Installation |
 | --- | --- | --- |
-| macOS — Apple Silicon and Intel | [Universal DMG](https://github.com/cjp2600/give/releases/latest/download/give-0.1.0-macos-universal.dmg) · [ZIP](https://github.com/cjp2600/give/releases/latest/download/give-0.1.0-macos-universal.zip) | Move give.app to Applications. Signed and notarized by Apple. |
-| Linux — x86_64 | [tar.gz](https://github.com/cjp2600/give/releases/latest/download/give-0.1.0-linux-x64.tar.gz) | Extract and run `./give`. Requires glibc 2.36+, X11 or Wayland, libxkbcommon, and a working Vulkan driver. |
+| macOS — Apple Silicon and Intel | [Universal DMG](https://github.com/cjp2600/give/releases/download/v0.1.0/give-0.1.0-macos-universal.dmg) · [ZIP](https://github.com/cjp2600/give/releases/download/v0.1.0/give-0.1.0-macos-universal.zip) | Move give.app to Applications. Developer ID signed; notarized by Apple. |
+| Linux — x86_64 | [tar.gz](https://github.com/cjp2600/give/releases/download/v0.1.0/give-0.1.0-linux-x64.tar.gz) | Extract and run `./give`. Requires glibc 2.36+, X11 or Wayland, libxkbcommon, and a working Vulkan driver. |
 
-The Windows x64 package is still building and will be added after validation. Install Git and make it available on PATH on every platform. Rust and Xcode are only needed when building from source.
+Windows builds are optional and are not included in this release. Install Git and make it available on PATH on every platform. Rust and Xcode are only needed when building from source.
 
-Verify downloads with [SHA256SUMS](https://github.com/cjp2600/give/releases/latest/download/SHA256SUMS). [Third-party license notices](https://github.com/cjp2600/give/releases/latest/download/THIRD-PARTY-NOTICES.txt) are included with the release.
+Verify downloads with [SHA256SUMS](https://github.com/cjp2600/give/releases/download/v0.1.0/SHA256SUMS). [Third-party license notices](https://github.com/cjp2600/give/releases/download/v0.1.0/THIRD-PARTY-NOTICES.txt) are included with the release.
 
 ### Source requirements
 
@@ -71,7 +71,7 @@ Verify downloads with [SHA256SUMS](https://github.com/cjp2600/give/releases/late
 
 GPUI's runtime shader feature is enabled, so a separate Metal compiler download is not required.
 
-### Run from source
+### Run from source on macOS
 
 Clone the repository and launch give:
 
