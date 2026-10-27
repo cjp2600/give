@@ -91,6 +91,8 @@ make run ARGS="/path/to/project --review feature/signup"
 
 You can also open a repository from the start screen or with **⌘O**.
 
+The first project opens directly in the current window. Once a project is open, choosing another from the app, recent projects, or the macOS Dock menu asks whether to replace it or open a new give process. Choose **Open in New Process** to keep the current window and terminal session running, or **Cancel** to stay where you are.
+
 ### Build a macOS app
 
 ```sh
@@ -102,6 +104,18 @@ make app
 make install
 ```
 
+## Settings and themes
+
+Open **File → Settings…**, the toolbar's **Settings** button, or **⌘,**. Settings apply globally to every project. They are saved for future launches, and other running give processes pick up changes within about a second.
+
+- **Appearance:** theme, source preview font size, and a shared monospace font.
+- **Terminal:** font size, minimum grid width, and cursor blinking. Existing shells keep running.
+- **Workspace:** refresh interval, the default display of deleted lines, recent-project limit, and Git history page size.
+
+The built-in themes are **give Dark**, **Nord**, **Dracula**, **Tokyo Night**, **Catppuccin Mocha**, and **Catppuccin Latte** (light). Themes cover panels, menus, dialogs, diffs, source highlighting, rendered Markdown, and the terminal palette. Selecting a theme previews it immediately; **Cancel** restores the saved theme. **Apply** saves all changes, and **Restore defaults** stages the original defaults for review before saving.
+
+On macOS preferences live in `~/Library/Application Support/give/settings.json`; Linux uses `$XDG_CONFIG_HOME/give/settings.json` (or `~/.config/give/settings.json`), and Windows uses `%APPDATA%/give/settings.json`. Missing fields inherit defaults. Invalid edits retain the last valid settings until corrected. Palette definitions and upstream sources are documented in [assets/themes](assets/themes/README.md).
+
 ## Keyboard shortcuts
 
 These are the macOS shortcuts. Navigation applies to the focused pane; text fields and terminal programs keep their normal input behavior.
@@ -109,6 +123,7 @@ These are the macOS shortcuts. Navigation applies to the focused pane; text fiel
 | Shortcut | Action |
 | --- | --- |
 | **⌘O** | Open a repository |
+| **⌘,** | Open global settings |
 | **⌘1** | Show or hide the file tree |
 | **⌘2** / **⌘B** | Show or hide the terminal while a file preview is open |
 | **⌘W** | Close the active preview, or the quick terminal when it has focus |

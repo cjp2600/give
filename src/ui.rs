@@ -17,6 +17,7 @@ use give::{
     text_selection::{self, Point as TextPoint, Selection as TextSelection},
     tree::{self, RowKind, TreeRow},
 };
+use give::{settings, theme};
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme as _, Disableable, Sizable, TitleBar,
@@ -34,23 +35,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-
-const BACKGROUND: u32 = 0x1b2632;
-const PANEL: u32 = 0x192330;
-const SURFACE: u32 = 0x213143;
-const BORDER: u32 = 0x2a394b;
-const TEXT: u32 = 0xcbd5e1;
-const MUTED: u32 = 0x7a8da5;
-const ACCENT: u32 = 0x87b1d7;
-const BRAND_ORANGE: u32 = 0xf28c45;
-const GREEN: u32 = 0x9ac9ad;
-const RED: u32 = 0xdb929d;
-// File-name colors by change kind, as in JetBrains IDEs.
-const NAME_MODIFIED: u32 = 0x7fb2ea;
-const NAME_ADDED: u32 = 0x8fd3a4;
-const NAME_DELETED: u32 = 0x75808c;
-const NAME_UNTRACKED: u32 = 0xe08e98;
-const LINE_HEIGHT: f32 = 26.;
 
 /// What the left tree lists: only changed paths (the default) or every project file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +132,7 @@ pub struct Give {
     busy: bool,
     opening: bool,
     picking: bool,
+    project_open_pending: bool,
     refreshing: bool,
     preview_loading: bool,
     epoch: u64,
@@ -179,6 +164,7 @@ pub struct Give {
     branch_scroll: UniformListScrollHandle,
     /// Recently opened project roots, newest first.
     recent: Vec<PathBuf>,
+    applied_settings: settings::Settings,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -344,7 +330,7 @@ impl Give {
             scrollbar_drag: None,
             changes: Arc::default(),
             widest_line: 0,
-            show_deletions: false,
+            show_deletions: settings::current().show_deletions,
             preview_cursor: 0,
             text_selection: None,
             find,
@@ -379,6 +365,7 @@ impl Give {
             busy: false,
             opening: false,
             picking: false,
+            project_open_pending: false,
             refreshing: false,
             preview_loading: false,
             epoch: 0,
@@ -408,6 +395,7 @@ impl Give {
             recent: recent::store()
                 .map(|file| recent::load(&file))
                 .unwrap_or_default(),
+            applied_settings: settings::current(),
             _subscriptions: subscriptions,
         };
         crate::update_dock_menu(&this.recent, cx);
@@ -419,7 +407,9 @@ impl Give {
         }
         cx.spawn(async move |view, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(2)).await;
+                cx.background_executor()
+                    .timer(Duration::from_secs(settings::current().refresh_seconds))
+                    .await;
                 if view.update(cx, |this, cx| this.refresh(cx)).is_err() {
                     break;
                 }
@@ -664,7 +654,7 @@ impl Give {
     }
 
     fn open_picker(&mut self, _: &OpenRepository, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.opening || self.picking {
+        if self.busy || self.opening || self.picking || self.project_open_pending {
             return;
         }
         self.picking = true;
@@ -681,7 +671,7 @@ impl Give {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(path) = paths.into_iter().next() {
-                            this.open(path, window, cx);
+                            this.request_open(path, window, cx);
                         }
                     }
                     Ok(Err(error)) => this.show_error(error, cx),
@@ -693,7 +683,69 @@ impl Give {
         .detach();
     }
 
-    pub(crate) fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ask how to open a project only when a workspace is already open.
+    pub(crate) fn request_open(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || self.opening || self.picking || self.project_open_pending {
+            return;
+        }
+        if self.repo.is_none() {
+            self.open(path, window, cx);
+            return;
+        }
+        self.project_open_pending = true;
+        let detail = format!(
+            "{}\n\nOpen this project in the current window, or start a new give process and keep this window open.",
+            recent::display(&path)
+        );
+        let answer = window.prompt(
+            PromptLevel::Info,
+            "How would you like to open this project?",
+            Some(&detail),
+            &["Replace Current Project", "Open in New Process", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            let answer = answer.await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.project_open_pending = false;
+                match answer {
+                    Ok(0) => this.open(path, window, cx),
+                    Ok(1) => this.open_in_new_process(path, cx),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_in_new_process(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.project_open_pending = true;
+        let task = cx.background_executor().spawn(async move {
+            let repo = Repository::open(&path)?;
+            crate::project_launch::launch(&repo.root)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.project_open_pending = false;
+                if let Err(error) = result {
+                    this.show_error(format!("Could not open a new give process: {error:#}"), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // Startup and returning from branch review already have an opening decision.
+    fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -1335,7 +1387,7 @@ impl Give {
             / if self.focus_left {
                 TREE_HEIGHT
             } else {
-                LINE_HEIGHT
+                settings::preview_line_height()
             })
         .max(1.) as isize;
         self.navigate(direction * rows, window, cx);
@@ -2253,15 +2305,16 @@ impl Give {
         let bounds = state.base_handle.bounds();
         let mut offset = state.base_handle.offset();
         if position.y < bounds.top() {
-            offset.y += px(LINE_HEIGHT);
+            offset.y += px(settings::preview_line_height());
         } else if position.y > bounds.bottom() {
-            offset.y -= px(LINE_HEIGHT);
+            offset.y -= px(settings::preview_line_height());
         }
         state.base_handle.set_offset(offset);
         let y = position.y.clamp(bounds.top(), bounds.bottom() - px(1.));
-        let row = (f32::from(y - bounds.top() - state.base_handle.offset().y) / LINE_HEIGHT)
-            .floor()
-            .max(0.) as usize;
+        let row = (f32::from(y - bounds.top() - state.base_handle.offset().y)
+            / settings::preview_line_height())
+        .floor()
+        .max(0.) as usize;
         drop(state);
         let point = self.selection_point(row.min(self.diff.lines.len() - 1), position);
         if let Some(selection) = &mut self.text_selection {
@@ -2470,7 +2523,7 @@ impl Give {
             .when(sidebar, |el| el.w(px(width)).flex_shrink_0())
             .when(!sidebar, |el| el.flex_1().min_w_0())
             .h_full()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme::current().colors.panel))
             .when(sidebar, |el| {
                 el.child(
                     div()
@@ -2479,8 +2532,8 @@ impl Give {
                         .h_full()
                         .flex_shrink_0()
                         .cursor_col_resize()
-                        .bg(rgb(BORDER))
-                        .hover(|el| el.bg(rgb(ACCENT)))
+                        .bg(rgb(theme::current().colors.border))
+                        .hover(|el| el.bg(rgb(theme::current().colors.accent)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -2543,8 +2596,8 @@ impl Give {
             // TitleBar supplies an inner 12 px inset in fullscreen; the outer
             // traffic-light reserve is only needed in a windowed macOS window.
             .when(window.is_fullscreen(), |bar| bar.pl_0())
-            .bg(rgb(0x151e28))
-            .border_color(rgb(BORDER))
+            .bg(rgb(theme::current().colors.title_bar))
+            .border_color(rgb(theme::current().colors.border))
             .child(
                 div()
                     .flex()
@@ -2553,79 +2606,85 @@ impl Give {
                     .text_size(px(12.))
                     .child(brand_wordmark(14.))
                     .when_some(name, |el, name| {
-                        el.child(div().text_color(rgb(BORDER)).child("/"))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                        el.child(
+                            div()
+                                .text_color(rgb(theme::current().colors.border))
+                                .child("/"),
+                        )
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
                     })
                     .when(self.repo.is_some(), |el| {
-                        el.child(div().text_color(rgb(BORDER)).child("/"))
-                            .when(self.review_branch.is_some(), |el| {
-                                el.child(
-                                    div()
-                                        .px_1p5()
-                                        .rounded(px(3.))
-                                        .bg(rgb(0x2b4057))
-                                        .text_size(px(10.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(ACCENT))
-                                        .child("REVIEW"),
-                                )
-                            })
-                            .child(
+                        el.child(
+                            div()
+                                .text_color(rgb(theme::current().colors.border))
+                                .child("/"),
+                        )
+                        .when(self.review_branch.is_some(), |el| {
+                            el.child(
                                 div()
-                                    .id("current-branch")
-                                    .relative()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.))
-                                    .cursor_pointer()
-                                    .hover(|el| el.bg(rgb(SURFACE)))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if this.picker_open {
-                                            this.close_picker(window, cx);
-                                        } else {
-                                            this.show_branch_picker(
-                                                BranchPickerMode::Switch,
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                    }))
-                                    .text_color(rgb(if self.review_branch.is_some() {
-                                        TEXT
-                                    } else {
-                                        MUTED
-                                    }))
-                                    .child(ui_icon("branch", 13., MUTED))
-                                    .child(
-                                        div().max_w(px(300.)).truncate().child(
-                                            self.review_branch
-                                                .clone()
-                                                .unwrap_or_else(|| self.snapshot.branch.clone()),
-                                        ),
-                                    )
-                                    .child(ui_icon("chevron-down", 10., MUTED))
-                                    .child(
-                                        canvas(
-                                            move |bounds, _, _| branch_bounds.set(bounds),
-                                            |_, _, _, _| {},
-                                        )
-                                        .absolute()
-                                        .inset_0(),
-                                    ),
+                                    .px_1p5()
+                                    .rounded(px(3.))
+                                    .bg(rgb(theme::current().colors.selected))
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme::current().colors.accent))
+                                    .child("REVIEW"),
                             )
-                            .when_some(self.review.as_ref(), |el, review| {
-                                el.child(
-                                    div()
-                                        .text_color(rgb(MUTED))
-                                        .child(format!("vs {}", review.compared_to())),
+                        })
+                        .child(
+                            div()
+                                .id("current-branch")
+                                .relative()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|el| el.bg(rgb(theme::current().colors.surface)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if this.picker_open {
+                                        this.close_picker(window, cx);
+                                    } else {
+                                        this.show_branch_picker(
+                                            BranchPickerMode::Switch,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }))
+                                .text_color(rgb(if self.review_branch.is_some() {
+                                    theme::current().colors.text
+                                } else {
+                                    theme::current().colors.muted
+                                }))
+                                .child(ui_icon("branch", 13., theme::current().colors.muted))
+                                .child(
+                                    div().max_w(px(300.)).truncate().child(
+                                        self.review_branch
+                                            .clone()
+                                            .unwrap_or_else(|| self.snapshot.branch.clone()),
+                                    ),
                                 )
-                            })
+                                .child(ui_icon("chevron-down", 10., theme::current().colors.muted))
+                                .child(
+                                    canvas(
+                                        move |bounds, _, _| branch_bounds.set(bounds),
+                                        |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                ),
+                        )
+                        .when_some(self.review.as_ref(), |el, review| {
+                            el.child(
+                                div()
+                                    .text_color(rgb(theme::current().colors.muted))
+                                    .child(format!("vs {}", review.compared_to())),
+                            )
+                        })
                     }),
             )
             .child(
@@ -2645,11 +2704,11 @@ impl Give {
                             .rounded(px(4.))
                             .cursor_pointer()
                             .bg(rgb(if self.sidebar_visible {
-                                SURFACE
+                                theme::current().colors.surface
                             } else {
-                                0x151e28
+                                theme::current().colors.title_bar
                             }))
-                            .hover(|el| el.bg(rgb(SURFACE)))
+                            .hover(|el| el.bg(rgb(theme::current().colors.surface)))
                             .tooltip(|window, cx| {
                                 Tooltip::new("Toggle left sidebar · ⌘1").build(window, cx)
                             })
@@ -2660,7 +2719,11 @@ impl Give {
                             .child(ui_icon(
                                 "panel-left",
                                 17.,
-                                if self.sidebar_visible { ACCENT } else { MUTED },
+                                if self.sidebar_visible {
+                                    theme::current().colors.accent
+                                } else {
+                                    theme::current().colors.muted
+                                },
                             )),
                     )
                     .child(
@@ -2674,14 +2737,14 @@ impl Give {
                             .rounded(px(4.))
                             .cursor_pointer()
                             .bg(rgb(if self.terminal_visible {
-                                SURFACE
+                                theme::current().colors.surface
                             } else {
-                                0x151e28
+                                theme::current().colors.title_bar
                             }))
                             .when(self.repo.is_some() && self.selected.is_none(), |el| {
                                 el.opacity(0.5)
                             })
-                            .hover(|el| el.bg(rgb(SURFACE)))
+                            .hover(|el| el.bg(rgb(theme::current().colors.surface)))
                             .tooltip({
                                 let can_hide = self.repo.is_none() || self.selected.is_some();
                                 move |window, cx| {
@@ -2700,7 +2763,11 @@ impl Give {
                             .child(ui_icon(
                                 "panel-right",
                                 17.,
-                                if self.terminal_visible { ACCENT } else { MUTED },
+                                if self.terminal_visible {
+                                    theme::current().colors.accent
+                                } else {
+                                    theme::current().colors.muted
+                                },
                             )),
                     )
                     .when(self.review_branch.is_some(), |el| {
@@ -2737,6 +2804,15 @@ impl Give {
                                 cx.listener(|this, _, window, cx| this.manual_refresh(window, cx)),
                             ),
                     )
+                    .child(
+                        Button::new("settings")
+                            .ghost()
+                            .xsmall()
+                            .label("Settings")
+                            .icon(gpui_component::Icon::empty().path("icons/config.svg"))
+                            .tooltip("Settings · ⌘,")
+                            .on_click(|_, window, cx| crate::settings_view::open(window, cx)),
+                    )
                     .child({
                         let view = cx.entity().downgrade();
                         let recent = self.recent.clone();
@@ -2746,7 +2822,12 @@ impl Give {
                             .xsmall()
                             .label("Open project")
                             .icon(gpui_component::Icon::empty().path("icons/chevron-down.svg"))
-                            .disabled(self.busy)
+                            .disabled(
+                                self.busy
+                                    || self.opening
+                                    || self.picking
+                                    || self.project_open_pending,
+                            )
                             .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, _| {
                                 let mut menu = menu.min_w(px(260.)).max_w(px(420.));
                                 let recent = recent
@@ -2767,7 +2848,7 @@ impl Give {
                                             .on_click(move |_, window, cx| {
                                                 let path = path.clone();
                                                 let _ = view.update(cx, |this, cx| {
-                                                    this.open(path, window, cx)
+                                                    this.request_open(path, window, cx)
                                                 });
                                             }),
                                         );
@@ -2851,12 +2932,12 @@ impl Give {
                             .items_center()
                             .gap_2()
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(theme::current().colors.muted))
                             .when(reviewing, |el| el.child("BRANCH"))
                             .when(!reviewing, |el| el.child(self.tree_mode_menu(cx)))
                             .child(
                                 div()
-                                    .text_color(rgb(ACCENT))
+                                    .text_color(rgb(theme::current().colors.accent))
                                     .child(self.snapshot.files.len().to_string()),
                             ),
                     )
@@ -2880,7 +2961,7 @@ impl Give {
                     Input::new(&self.filter_input)
                         .small()
                         .appearance(false)
-                        .prefix(ui_icon("search", 13., MUTED)),
+                        .prefix(ui_icon("search", 13., theme::current().colors.muted)),
                 ),
             )
             .child(
@@ -2907,7 +2988,7 @@ impl Give {
                                                     } else {
                                                         "folder"
                                                     },
-                                                    0x8aa6bc,
+                                                    theme::current().colors.folder,
                                                     String::new(),
                                                 ),
                                                 RowKind::File(file) => {
@@ -2925,13 +3006,13 @@ impl Give {
                                                         _ => "file",
                                                     };
                                                     let color = match ext.as_ref() {
-                                                        "rs" => 0xc79679,
-                                                        "go" => 0x86b3c5,
-                                                        "md" => 0x86afd1,
+                                                        "rs" => theme::current().colors.rust,
+                                                        "go" => theme::current().colors.go,
+                                                        "md" => theme::current().colors.markdown,
                                                         "toml" | "json" | "yaml" | "yml" => {
-                                                            0xa79bc7
+                                                            theme::current().colors.config
                                                         }
-                                                        _ => MUTED,
+                                                        _ => theme::current().colors.muted,
                                                     };
                                                     let badge = if this.review_branch.is_some() {
                                                         file.index.to_string()
@@ -2950,7 +3031,7 @@ impl Give {
                                                     };
                                                     (icon, color, badge)
                                                 }
-                                                _ => ("file", MUTED, String::new()),
+                                                _ => ("file", theme::current().colors.muted, String::new()),
                                             };
                                             let name_color = match &row.kind {
                                                 RowKind::File(file) => file_name_color(file),
@@ -2958,10 +3039,10 @@ impl Give {
                                                 RowKind::Directory { .. }
                                                     if row.changed && this.catalog() =>
                                                 {
-                                                    NAME_MODIFIED
+                                                    theme::current().colors.modified
                                                 }
-                                                _ if navigable => TEXT,
-                                                _ => MUTED,
+                                                _ if navigable => theme::current().colors.text,
+                                                _ => theme::current().colors.muted,
                                             };
                                             div()
                                                 .id(index)
@@ -2971,10 +3052,10 @@ impl Give {
                                                 .pr_3()
                                                 .flex()
                                                 .items_center()
-                                                .bg(rgb(if selected { 0x2b4057 } else { PANEL }))
+                                                .bg(rgb(if selected { theme::current().colors.selected } else { theme::current().colors.panel }))
                                                 .when(navigable, |el| {
                                                     el.cursor_pointer()
-                                                        .hover(|el| el.bg(rgb(SURFACE)))
+                                                        .hover(|el| el.bg(rgb(theme::current().colors.surface)))
                                                         .on_mouse_down(
                                                             MouseButton::Right,
                                                             cx.listener(move |this, _, _, _| {
@@ -3000,7 +3081,7 @@ impl Give {
                                                 })
                                                 .when(matches!(row.kind, RowKind::Divider), |el| {
                                                     el.child(
-                                                        div().w_full().h(px(1.)).bg(rgb(BORDER)),
+                                                        div().w_full().h(px(1.)).bg(rgb(theme::current().colors.border)),
                                                     )
                                                 })
                                                 .when(!matches!(row.kind, RowKind::Divider), |el| {
@@ -3011,7 +3092,7 @@ impl Give {
                                                                     .w(px(16.))
                                                                     .h_full()
                                                                     .border_l_1()
-                                                                    .border_color(rgb(0x304052))
+                                                                    .border_color(rgb(theme::current().colors.guide))
                                                             }),
                                                         ))
                                                         .child(
@@ -3034,7 +3115,7 @@ impl Give {
                                                                             "chevron-right"
                                                                         },
                                                                         10.,
-                                                                        MUTED,
+                                                                        theme::current().colors.muted,
                                                                     ))
                                                                 },
                                                             ),
@@ -3069,9 +3150,9 @@ impl Give {
                                                                 .ml_2()
                                                                 .text_size(px(10.))
                                                                 .text_color(rgb(if row.untracked {
-                                                                    GREEN
+                                                                    theme::current().colors.green
                                                                 } else {
-                                                                    0xc5b28a
+                                                                    theme::current().colors.yellow
                                                                 }))
                                                                 .child(badge),
                                                         )
@@ -3090,9 +3171,9 @@ impl Give {
                             div()
                                 .p_4()
                                 .text_color(rgb(if self.review_error.is_some() {
-                                    RED
+                                    theme::current().colors.red
                                 } else {
-                                    MUTED
+                                    theme::current().colors.muted
                                 }))
                                 .child(if let Some(step) = self.review_step {
                                     step.to_owned()
@@ -3113,17 +3194,17 @@ impl Give {
                 el.child(
                     div()
                         .border_t_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(theme::current().colors.border))
                         .px_3()
                         .py_2()
                         .flex()
                         .flex_col()
                         .gap_1()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(theme::current().colors.muted))
                         .child(
                             div()
-                                .text_color(rgb(TEXT))
+                                .text_color(rgb(theme::current().colors.text))
                                 .child(if self.review_step.is_some() {
                                     "Loading review…".to_owned()
                                 } else {
@@ -3140,7 +3221,7 @@ impl Give {
                 el.child(
                     div()
                         .border_t_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(theme::current().colors.border))
                         .p_1p5()
                         .child(
                             Button::new("commit-toggle")
@@ -3204,7 +3285,7 @@ impl Give {
             .w(px(self.sidebar_width))
             .flex_shrink_0()
             .h_full()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme::current().colors.panel))
             .child(content)
             .child(
                 div()
@@ -3213,8 +3294,8 @@ impl Give {
                     .h_full()
                     .flex_shrink_0()
                     .cursor_col_resize()
-                    .bg(rgb(BORDER))
-                    .hover(|el| el.bg(rgb(ACCENT)))
+                    .bg(rgb(theme::current().colors.border))
+                    .hover(|el| el.bg(rgb(theme::current().colors.accent)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -3230,7 +3311,7 @@ impl Give {
             return 0;
         }
         let height = self.diff_scroll.0.borrow().base_handle.bounds().size.height;
-        (f32::from(height) / LINE_HEIGHT / 2.).max(1.) as usize
+        (f32::from(height) / settings::preview_line_height() / 2.).max(1.) as usize
     }
 
     fn drag_overview(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -3241,11 +3322,13 @@ impl Give {
         let y = f32::from(event.position.y - bounds.origin.y);
         let height = f32::from(bounds.size.height);
         let state = self.diff_scroll.0.borrow();
-        let visible = f32::from(state.base_handle.bounds().size.height) / LINE_HEIGHT;
+        let visible =
+            f32::from(state.base_handle.bounds().size.height) / settings::preview_line_height();
         let total = self.diff.lines.len() + self.preview_bottom_padding();
         if let Some((_, size)) = scrollbar::thumb_with_minimum(total, visible, 0., height, 12.) {
             let percent = ((y - grab) / (height - size).max(1.)).clamp(0., 1.);
-            let offset = percent * (total as f32 - visible).max(0.) * LINE_HEIGHT;
+            let offset =
+                percent * (total as f32 - visible).max(0.) * settings::preview_line_height();
             let x = state.base_handle.offset().x;
             state.base_handle.set_offset(point(x, -px(offset)));
         }
@@ -3262,10 +3345,10 @@ impl Give {
             .w(px(14.))
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(0x17222e))
+            .bg(rgb(theme::current().colors.scrollbar_track))
             .cursor_pointer()
             .border_l_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(theme::current().colors.border))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -3273,8 +3356,10 @@ impl Give {
                     let y = f32::from(event.position.y - bounds.origin.y);
                     let height = f32::from(bounds.size.height);
                     let state = this.diff_scroll.0.borrow();
-                    let visible = f32::from(state.base_handle.bounds().size.height) / LINE_HEIGHT;
-                    let offset = -f32::from(state.base_handle.offset().y) / LINE_HEIGHT;
+                    let visible = f32::from(state.base_handle.bounds().size.height)
+                        / settings::preview_line_height();
+                    let offset =
+                        -f32::from(state.base_handle.offset().y) / settings::preview_line_height();
                     let total = this.diff.lines.len() + this.preview_bottom_padding();
                     let thumb = scrollbar::thumb_with_minimum(total, visible, offset, height, 12.);
                     drop(state);
@@ -3318,9 +3403,10 @@ impl Give {
                     move |bounds, _, window, _| {
                         let height = f32::from(bounds.size.height);
                         let state = scroll.0.borrow();
-                        let visible =
-                            f32::from(state.base_handle.bounds().size.height) / LINE_HEIGHT;
-                        let offset = -f32::from(state.base_handle.offset().y) / LINE_HEIGHT;
+                        let visible = f32::from(state.base_handle.bounds().size.height)
+                            / settings::preview_line_height();
+                        let offset = -f32::from(state.base_handle.offset().y)
+                            / settings::preview_line_height();
                         if let Some((start, size)) =
                             scrollbar::thumb_with_minimum(total, visible, offset, height, 12.)
                         {
@@ -3329,7 +3415,7 @@ impl Give {
                                     point(bounds.left() + px(3.), bounds.top() + px(start)),
                                     gpui::size(px(7.), px(size)),
                                 ),
-                                rgb(0x435a73),
+                                rgb(theme::current().colors.scrollbar_thumb),
                             ));
                         }
                         // Merge marks that map to the same pixels; a large changed block
@@ -3344,7 +3430,7 @@ impl Give {
                                         px((end - start + 2.).min(height - start).max(1.)),
                                     ),
                                 ),
-                                rgb(GREEN),
+                                rgb(theme::current().colors.green),
                             ));
                         };
                         for line in changes.iter() {
@@ -3388,15 +3474,15 @@ impl Give {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(rgb(BACKGROUND))
+            .bg(rgb(theme::current().colors.background))
             .child(
                 div()
                     .h(px(35.))
                     .flex_shrink_0()
                     .flex()
-                    .bg(rgb(PANEL))
+                    .bg(rgb(theme::current().colors.panel))
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(theme::current().colors.border))
                     .when(self.tabs.is_empty(), |el| {
                         el.child(
                             div()
@@ -3405,12 +3491,12 @@ impl Give {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .bg(rgb(BACKGROUND))
+                                .bg(rgb(theme::current().colors.background))
                                 .border_r_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(rgb(theme::current().colors.border))
                                 .border_b_2()
                                 .text_size(px(13.))
-                                .child(ui_icon("code", 14., ACCENT))
+                                .child(ui_icon("code", 14., theme::current().colors.accent))
                                 .child("Review"),
                         )
                     })
@@ -3435,19 +3521,19 @@ impl Give {
                                     .flex_shrink_0()
                                     .items_center()
                                     .gap_2()
-                                    .bg(rgb(if active { BACKGROUND } else { PANEL }))
+                                    .bg(rgb(if active { theme::current().colors.background } else { theme::current().colors.panel }))
                                     .border_r_1()
-                                    .border_color(rgb(BORDER))
+                                    .border_color(rgb(theme::current().colors.border))
                                     .when(active, |el| el.border_b_2())
                                     .when(!active, |el| {
-                                        el.cursor_pointer().hover(|el| el.bg(rgb(SURFACE)))
+                                        el.cursor_pointer().hover(|el| el.bg(rgb(theme::current().colors.surface)))
                                     })
                                     .text_size(px(13.))
-                                    .text_color(rgb(if active { TEXT } else { MUTED }))
+                                    .text_color(rgb(if active { theme::current().colors.text } else { theme::current().colors.muted }))
                                     .child(ui_icon(
                                         "code",
                                         14.,
-                                        if active { ACCENT } else { MUTED },
+                                        if active { theme::current().colors.accent } else { theme::current().colors.muted },
                                     ))
                                     .child(name)
                                     .child(
@@ -3475,16 +3561,16 @@ impl Give {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .bg(rgb(0x1e2c3b))
+                    .bg(rgb(theme::current().colors.preview_header))
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(theme::current().colors.border))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(theme::current().colors.muted))
                             .child(path),
                     )
                     .when(self.selected.is_some(), |el| {
@@ -3514,14 +3600,14 @@ impl Give {
                                     el.child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(rgb(GREEN))
+                                            .text_color(rgb(theme::current().colors.green))
                                             .child(format!("+{}", self.diff.additions)),
                                     )
                                     .child(
                                         div()
                                             .mr_2()
                                             .text_size(px(11.))
-                                            .text_color(rgb(RED))
+                                            .text_color(rgb(theme::current().colors.red))
                                             .child(format!("−{}", self.diff.deletions)),
                                     )
                                     .child(
@@ -3606,7 +3692,7 @@ impl Give {
                             .px_4()
                             .py_2()
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(theme::current().colors.muted))
                             .child(notice),
                     )
                 })
@@ -3629,18 +3715,18 @@ impl Give {
                                             let Some(line) = this.diff.lines.get(index) else {
                                                 return div()
                                                     .id(index)
-                                                    .h(px(LINE_HEIGHT))
+                                                    .h(px(settings::preview_line_height()))
                                                     .min_w_full();
                                             };
                                             let bg = match line.kind {
-                                                LineKind::Added => 0x223d34,
-                                                LineKind::Removed => 0x452c38,
+                                                LineKind::Added => theme::current().colors.diff_added,
+                                                LineKind::Removed => theme::current().colors.diff_removed,
                                                 _ if !this.focus_left
                                                     && this.preview_cursor == index =>
                                                 {
-                                                    0x223347
+                                                    theme::current().colors.cursor_line
                                                 }
-                                                _ => BACKGROUND,
+                                                _ => theme::current().colors.background,
                                             };
                                             let selected =
                                                 this.text_selection.and_then(|selection| {
@@ -3648,7 +3734,7 @@ impl Give {
                                                 });
                                             let fallback = vec![preview::Highlight {
                                                 range: 0..line.text.len(),
-                                                color: TEXT,
+                                                color: give::theme::SyntaxColor::Text,
                                             }];
                                             let syntax = this
                                                 .syntax
@@ -3700,13 +3786,13 @@ impl Give {
                                                     spans.push((
                                                         range.clone(),
                                                         HighlightStyle {
-                                                            color: Some(rgb(span.color).into()),
+                                                            color: Some(rgb(span.color.resolve(&theme::current().colors)).into()),
                                                             background_color: selected
                                                                 .as_ref()
                                                                 .filter(|selection| {
                                                                     selection.contains(&range.start)
                                                                 })
-                                                                .map(|_| rgb(0x3c5c7e).into())
+                                                                .map(|_| rgb(theme::current().colors.selection).into())
                                                                 .or_else(|| {
                                                                     row_matches
                                                                         .iter()
@@ -3722,9 +3808,9 @@ impl Give {
                                                                                 ) == this
                                                                                     .find_current
                                                                                 {
-                                                                                    0x87642c
+                                                                                    theme::current().colors.search_active
                                                                                 } else {
-                                                                                    0x514931
+                                                                                    theme::current().colors.search_match
                                                                                 },
                                                                             )
                                                                             .into()
@@ -3740,14 +3826,14 @@ impl Give {
                                             this.text_layouts.insert(index, code.layout().clone());
                                             div()
                                                 .id(index)
-                                                .h(px(LINE_HEIGHT))
+                                                .h(px(settings::preview_line_height()))
                                                 .min_w_full()
                                                 .flex()
                                                 .items_center()
                                                 .bg(rgb(bg))
-                                                .font_family("Menlo")
-                                                .text_size(px(15.))
-                                                .line_height(px(LINE_HEIGHT))
+                                                .font_family(settings::font_family())
+                                                .text_size(px(settings::current().preview_font_size))
+                                                .line_height(px(settings::preview_line_height()))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, event, window, cx| {
@@ -3772,7 +3858,7 @@ impl Give {
                                                                 .flex_shrink_0()
                                                                 .pr_2()
                                                                 .text_right()
-                                                                .text_color(rgb(MUTED))
+                                                                .text_color(rgb(theme::current().colors.muted))
                                                                 .child(
                                                                     line.old
                                                                         .map(|n| n.to_string())
@@ -3791,9 +3877,9 @@ impl Give {
                                                             if !this.focus_left
                                                                 && this.preview_cursor == index
                                                             {
-                                                                ACCENT
+                                                                theme::current().colors.accent
                                                             } else {
-                                                                MUTED
+                                                                theme::current().colors.muted
                                                             },
                                                         ))
                                                         .child(
@@ -3807,9 +3893,9 @@ impl Give {
                                                         .w(px(16.))
                                                         .flex_shrink_0()
                                                         .text_color(rgb(match line.kind {
-                                                            LineKind::Added => GREEN,
-                                                            LineKind::Removed => RED,
-                                                            _ => MUTED,
+                                                            LineKind::Added => theme::current().colors.green,
+                                                            LineKind::Removed => theme::current().colors.red,
+                                                            _ => theme::current().colors.muted,
                                                         }))
                                                         .child(match line.kind {
                                                             LineKind::Added => "+",
@@ -3857,7 +3943,7 @@ impl Give {
             .flex()
             .flex_col()
             .text_size(px(14.))
-            .text_color(rgb(TEXT))
+            .text_color(rgb(theme::current().colors.text))
             .child(
                 TextView::markdown(SharedString::from(id), self.markdown_text(), window, cx)
                     .style(style)
@@ -3896,7 +3982,7 @@ impl Give {
                     div()
                         .flex_shrink_0()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(theme::current().colors.muted))
                         .child(format!(
                             "{} × {}",
                             decoded.width.round(),
@@ -4022,9 +4108,9 @@ impl Give {
             .h_auto()
             .flex()
             .flex_col()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme::current().colors.panel))
             .border_1()
-            .border_color(rgb(0x35495f))
+            .border_color(rgb(theme::current().colors.popup_border))
             .rounded(px(8.))
             .shadow_lg()
             .overflow_hidden()
@@ -4042,7 +4128,12 @@ impl Give {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
-                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(hint)),
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(theme::current().colors.muted))
+                            .child(hint),
+                    ),
             )
             .when(switching, |el| {
                 el.child(
@@ -4092,17 +4183,17 @@ impl Give {
                     ),
                 )
             })
-            .child(
-                div().px_3().pb_2().child(
-                    Input::new(&self.branch_input)
-                        .small()
-                        .prefix(ui_icon("branch", 13., MUTED)),
-                ),
-            )
+            .child(div().px_3().pb_2().child(
+                Input::new(&self.branch_input).small().prefix(ui_icon(
+                    "branch",
+                    13.,
+                    theme::current().colors.muted,
+                )),
+            ))
             .child(
                 div()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(theme::current().colors.border))
                     .h(px(height))
                     .when(rows.is_empty(), |el| {
                         el.child(
@@ -4111,7 +4202,7 @@ impl Give {
                                 .px_4()
                                 .flex()
                                 .items_center()
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(theme::current().colors.muted))
                                 .child(if self.branches_loading {
                                     "Loading branches…"
                                 } else if self.picker_mode == BranchPickerMode::Push {
@@ -4150,7 +4241,7 @@ impl Give {
                         .px_4()
                         .py_2()
                         .text_size(px(11.))
-                        .text_color(rgb(RED))
+                        .text_color(rgb(theme::current().colors.red))
                         .child(note.chars().take(1800).collect::<String>()),
                 )
             })
@@ -4163,9 +4254,9 @@ impl Give {
                     .justify_between()
                     .gap_3()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(theme::current().colors.border))
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme::current().colors.muted))
                     .child(div().flex_1().min_w_0().truncate().child(if self.busy {
                         self.notice.clone()
                     } else if self.branches_loading {
@@ -4275,8 +4366,12 @@ impl Give {
             .items_center()
             .gap_2()
             .cursor_pointer()
-            .bg(rgb(if selected { 0x2b4057 } else { PANEL }))
-            .hover(|el| el.bg(rgb(SURFACE)))
+            .bg(rgb(if selected {
+                theme::current().colors.selected
+            } else {
+                theme::current().colors.panel
+            }))
+            .hover(|el| el.bg(rgb(theme::current().colors.surface)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.branch_cursor = index;
                 this.confirm_branch(window, cx);
@@ -4284,7 +4379,11 @@ impl Give {
             .child(ui_icon(
                 "branch",
                 13.,
-                if tag == "remote" { MUTED } else { ACCENT },
+                if tag == "remote" {
+                    theme::current().colors.muted
+                } else {
+                    theme::current().colors.accent
+                },
             ))
             .child(
                 div()
@@ -4298,15 +4397,20 @@ impl Give {
                 el.child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(GREEN))
+                        .text_color(rgb(theme::current().colors.green))
                         .child("current"),
                 )
             })
             .when(!tag.is_empty(), |el| {
-                el.child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(tag))
+                el.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(theme::current().colors.muted))
+                        .child(tag),
+                )
             })
             .when(self.picker_mode == BranchPickerMode::Switch, |el| {
-                el.child(ui_icon("chevron-right", 12., MUTED))
+                el.child(ui_icon("chevron-right", 12., theme::current().colors.muted))
             })
             .child(
                 canvas(
@@ -4340,9 +4444,9 @@ impl Give {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w(px(400.))
             .py_1()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme::current().colors.panel))
             .border_1()
-            .border_color(rgb(0x35495f))
+            .border_color(rgb(theme::current().colors.popup_border))
             .rounded(px(8.))
             .shadow_lg()
             .text_size(px(13.))
@@ -4351,7 +4455,7 @@ impl Give {
                     .px_3()
                     .py_2()
                     .text_size(px(11.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme::current().colors.muted))
                     .truncate()
                     .child(menu.branch.name.clone()),
             )
@@ -4383,11 +4487,11 @@ impl Give {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .bg(rgb(if menu.cursor == index {
-                        0x2b4057
+                        theme::current().colors.selected
                     } else {
-                        PANEL
+                        theme::current().colors.panel
                     }))
-                    .hover(|el| el.bg(rgb(SURFACE)))
+                    .hover(|el| el.bg(rgb(theme::current().colors.surface)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(menu) = &mut this.branch_menu {
                             menu.cursor = index;
@@ -4402,7 +4506,7 @@ impl Give {
                     .pt_2()
                     .pb_1()
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme::current().colors.muted))
                     .child("↑↓ choose · Enter run · ← / Esc back"),
             )
     }
@@ -4415,7 +4519,7 @@ impl Give {
             .items_center()
             .justify_center()
             .gap_6()
-            .bg(rgb(BACKGROUND))
+            .bg(rgb(theme::current().colors.background))
             .child(brand_wordmark(80.))
             .child(
                 Button::new("welcome-open")
@@ -4425,7 +4529,7 @@ impl Give {
                     } else {
                         "Open a Git repository"
                     })
-                    .disabled(self.opening)
+                    .disabled(self.opening || self.picking || self.project_open_pending)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_picker(&OpenRepository, window, cx)
                     })),
@@ -4442,22 +4546,23 @@ impl Give {
                                 .px_3()
                                 .pb_1()
                                 .text_size(px(11.))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(theme::current().colors.muted))
                                 .child("Recent projects"),
                         )
                         .children(self.recent.iter().take(5).enumerate().map(|(ix, path)| {
                             let target = path.clone();
                             div()
                                 .id(("welcome-recent", ix))
+                                .debug_selector(|| "welcome-recent-project".into())
                                 .px_3()
                                 .py_1p5()
                                 .rounded(px(5.))
                                 .cursor_pointer()
-                                .hover(|el| el.bg(rgb(SURFACE)))
+                                .hover(|el| el.bg(rgb(theme::current().colors.surface)))
                                 .when(self.opening, |el| el.opacity(0.5))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if !this.opening {
-                                        this.open(target.clone(), window, cx);
+                                        this.request_open(target.clone(), window, cx);
                                     }
                                 }))
                                 .child(recent_project_label(path))
@@ -4469,6 +4574,21 @@ impl Give {
 
 impl Render for Give {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let preferences = settings::current();
+        if self.applied_settings != preferences {
+            if self.applied_settings.show_deletions != preferences.show_deletions {
+                self.show_deletions = preferences.show_deletions;
+                self.load_diff(false, cx);
+            }
+            if self.applied_settings.recent_limit != preferences.recent_limit {
+                if let Some(file) = recent::store() {
+                    self.recent = recent::load(&file);
+                }
+                crate::update_dock_menu(&self.recent, cx);
+            }
+            self.text_layouts.clear();
+            self.applied_settings = preferences;
+        }
         // The last tab can also disappear during a background refresh.
         if self.repo.is_some() && self.selected.is_none() && !self.terminal_visible {
             self.terminal_visible = true;
@@ -4576,8 +4696,8 @@ impl Render for Give {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(BACKGROUND))
-            .text_color(rgb(TEXT))
+            .bg(rgb(theme::current().colors.background))
+            .text_color(rgb(theme::current().colors.text))
             .font_family(".SystemUIFont")
             .text_size(px(12.))
             .child(self.toolbar(window, cx))
@@ -4603,7 +4723,7 @@ impl Render for Give {
                     .h(px(self.history_height.min((f32::from(window.viewport_size().height) - 180.).max(150.))))
                     .min_h_0().overflow_hidden()
                     .child(div().id("history-resize").h(px(4.)).w_full().flex_shrink_0()
-                        .cursor_row_resize().bg(rgb(BORDER)).hover(|el| el.bg(rgb(ACCENT)))
+                        .cursor_row_resize().bg(rgb(theme::current().colors.border)).hover(|el| el.bg(rgb(theme::current().colors.accent)))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                             this.history_dragging = true;
                             cx.stop_propagation();
@@ -4620,23 +4740,23 @@ impl Render for Give {
                     .flex_shrink_0()
                     .px_4()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(PANEL))
+                    .border_color(rgb(theme::current().colors.border))
+                    .bg(rgb(theme::current().colors.panel))
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme::current().colors.muted))
                     .child(div().id("toggle-history").flex().items_center().gap_1().h_full().px_2()
                         .cursor_pointer().rounded_sm()
-                        .bg(rgb(if self.history_visible { SURFACE } else { PANEL }))
-                        .hover(|el| el.bg(rgb(SURFACE)))
+                        .bg(rgb(if self.history_visible { theme::current().colors.surface } else { theme::current().colors.panel }))
+                        .hover(|el| el.bg(rgb(theme::current().colors.surface)))
                         .tooltip(|window, cx| Tooltip::new("Git history").build(window, cx))
                         .on_click(cx.listener(|this, _, window, cx| this.toggle_history(&ToggleHistory, window, cx)))
-                        .child(ui_icon("history", 13., if self.history_visible { ACCENT } else { MUTED }))
+                        .child(ui_icon("history", 13., if self.history_visible { theme::current().colors.accent } else { theme::current().colors.muted }))
                         .child("Git"))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_color(rgb(if self.error { RED } else { MUTED }))
+                            .text_color(rgb(if self.error { theme::current().colors.red } else { theme::current().colors.muted }))
                             .child(self.notice.clone()),
                     )
                     .child(
@@ -4676,15 +4796,15 @@ fn load_slot(
 /// modified blue. Unchanged catalog files keep the plain text color.
 fn file_name_color(file: &ChangedFile) -> u32 {
     if file.clean() {
-        TEXT
+        theme::current().colors.text
     } else if file.untracked() || file.conflicted() {
-        NAME_UNTRACKED
+        theme::current().colors.untracked
     } else if file.index == 'D' || file.worktree == 'D' {
-        NAME_DELETED
+        theme::current().colors.deleted
     } else if file.index == 'A' {
-        NAME_ADDED
+        theme::current().colors.added
     } else {
-        NAME_MODIFIED
+        theme::current().colors.modified
     }
 }
 
@@ -4694,7 +4814,7 @@ fn brand_wordmark(size: f32) -> Div {
         .text_size(px(size))
         .line_height(relative(1.))
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(BRAND_ORANGE))
+        .text_color(rgb(theme::current().colors.brand))
         .child("give")
 }
 
@@ -4718,7 +4838,7 @@ fn empty_state(title: impl Into<SharedString>, detail: impl Into<SharedString>, 
         .child(
             div()
                 .text_size(px(18.))
-                .text_color(rgb(TEXT))
+                .text_color(rgb(theme::current().colors.text))
                 .child(title.into()),
         )
         .child(
@@ -4726,7 +4846,7 @@ fn empty_state(title: impl Into<SharedString>, detail: impl Into<SharedString>, 
                 .max_w(px(560.))
                 .text_center()
                 .text_size(px(12.))
-                .text_color(rgb(MUTED))
+                .text_color(rgb(theme::current().colors.muted))
                 .child(detail.into()),
         )
 }
@@ -4742,7 +4862,7 @@ fn recent_project_label(path: &std::path::Path) -> Div {
         .items_center()
         .gap_2()
         .min_w_0()
-        .child(ui_icon("folder", 14., MUTED))
+        .child(ui_icon("folder", 14., theme::current().colors.muted))
         .child(
             div()
                 .flex()
@@ -4751,14 +4871,14 @@ fn recent_project_label(path: &std::path::Path) -> Div {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(theme::current().colors.text))
                         .truncate()
                         .child(name),
                 )
                 .child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(theme::current().colors.muted))
                         .truncate()
                         .child(recent::display(path)),
                 ),
@@ -4779,6 +4899,99 @@ mod tests {
     use gpui_component::{Root, WindowExt};
     // The GPUI glob also exports a `test` macro; the generated attribute needs Rust's.
     use std::prelude::v1::test;
+
+    #[gpui::test]
+    fn project_choice_preserves_workspace_until_replacement(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::terminal_view::init(cx);
+            crate::find_view::init(cx);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().to_path_buf();
+        let missing = current.join("missing project");
+        let mut view = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let give = cx.new(|cx| Give::new(None, None, window, cx));
+            give.update(cx, |give, cx| {
+                give.recent = vec![missing.clone()];
+                cx.notify();
+            });
+            view = Some(give.clone());
+            Root::new(give, window, cx)
+        });
+        let view = view.unwrap();
+
+        // The welcome screen opens directly in this process, without a prompt.
+        cx.refresh().unwrap();
+        let row = cx.debug_bounds("welcome-recent-project").unwrap();
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        view.read_with(cx, |give, _| {
+            assert!(give.repo.is_none());
+            assert!(give.error, "the repository loader ran without confirmation");
+            assert!(!give.project_open_pending);
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |give, cx| {
+                give.repo = Some(Repository {
+                    root: current.clone(),
+                });
+                give.tabs = vec![PathBuf::from("draft.md")];
+                give.selected = Some(PathBuf::from("draft.md"));
+                give.commit_input.update(cx, |input, cx| {
+                    input.set_value("Unfinished commit", window, cx)
+                });
+                give.request_open(missing.clone(), window, cx);
+                // Repeated requests must not stack sheets or change the target.
+                give.request_open(current.clone(), window, cx);
+            });
+        });
+        assert!(cx.pending_prompt().unwrap().1.contains("missing project"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        view.read_with(cx, |give, cx| {
+            assert_eq!(give.repo.as_ref().unwrap().root, current);
+            assert_eq!(give.tabs, [PathBuf::from("draft.md")]);
+            assert_eq!(give.commit_input.read(cx).value(), "Unfinished commit");
+            assert!(!give.project_open_pending);
+        });
+
+        // A failed launch reports an error without replacing the current workspace.
+        cx.update(|window, cx| {
+            view.update(cx, |give, cx| {
+                give.request_open(missing.clone(), window, cx)
+            });
+        });
+        cx.simulate_prompt_answer("Open in New Process");
+        cx.run_until_parked();
+        view.read_with(cx, |give, _| {
+            assert_eq!(give.repo.as_ref().unwrap().root, current);
+            assert_eq!(give.tabs, [PathBuf::from("draft.md")]);
+            assert!(give.error);
+            assert!(give.notice.contains("Could not open a new give process"));
+            assert!(!give.opening);
+            assert!(!give.project_open_pending);
+        });
+
+        // Replacement invokes the regular repository loader only after confirmation.
+        cx.update(|window, cx| {
+            view.update(cx, |give, cx| {
+                give.request_open(missing.clone(), window, cx)
+            });
+        });
+        cx.simulate_prompt_answer("Replace Current Project");
+        cx.run_until_parked();
+        view.read_with(cx, |give, _| {
+            assert!(give.error);
+            assert!(!give.notice.contains("new give process"));
+            assert!(!give.project_open_pending);
+        });
+        assert!(!cx.has_pending_prompt());
+    }
 
     #[gpui::test]
     fn quick_terminal_button_displays_modal(cx: &mut TestAppContext) {

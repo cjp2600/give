@@ -1,13 +1,16 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod accessibility;
+mod appearance;
 mod find_view;
 mod image_view;
+mod project_launch;
+mod settings_view;
 mod terminal_view;
 mod ui;
 
 use gpui::{actions, prelude::*, *};
-use gpui_component::{Root, Theme, ThemeMode};
+use gpui_component::Root;
 use std::{borrow::Cow, path::PathBuf};
 
 struct Assets;
@@ -78,6 +81,7 @@ actions!(
     [
         Quit,
         OpenRepository,
+        OpenSettings,
         Refresh,
         Commit,
         NextFile,
@@ -174,28 +178,7 @@ fn main() {
             gpui_component::init(cx);
             terminal_view::init(cx);
             find_view::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
-            let theme = Theme::global_mut(cx);
-            theme.colors.background = rgb(0x1b2632).into();
-            theme.colors.foreground = rgb(0xcbd5e1).into();
-            theme.colors.border = rgb(0x2a394b).into();
-            theme.colors.input = rgb(0x1c2a39).into();
-            theme.colors.muted = rgb(0x223142).into();
-            theme.colors.muted_foreground = rgb(0x7f92a8).into();
-            theme.colors.secondary = rgb(0x25364a).into();
-            theme.colors.secondary_hover = rgb(0x2e425a).into();
-            theme.colors.secondary_active = rgb(0x354d67).into();
-            theme.colors.secondary_foreground = rgb(0xcbd5e1).into();
-            // TextView paints selection over glyphs, so it must be translucent;
-            // over the background this blends to about 0x304b67.
-            theme.colors.selection = rgba(0x5a8fc85a).into();
-            theme.colors.title_bar = rgb(0x151e28).into();
-            theme.colors.title_bar_border = rgb(0x263445).into();
-            theme.colors.primary = rgb(0x83afd5).into();
-            theme.colors.primary_hover = rgb(0xa2c8e7).into();
-            theme.colors.primary_active = rgb(0x6997c0).into();
-            theme.colors.primary_foreground = rgb(0x142334).into();
-            theme.colors.ring = rgb(0x83afd5).into();
+            appearance::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([
                 KeyBinding::new("secondary-c", CopyPath, Some("Give && !Input && !Terminal")),
@@ -230,6 +213,7 @@ fn main() {
                     Some("Give && !Input && !Terminal"),
                 ),
                 KeyBinding::new("secondary-q", Quit, None),
+                KeyBinding::new("secondary-,", OpenSettings, None),
                 KeyBinding::new("secondary-o", OpenRepository, Some("Give")),
                 KeyBinding::new("secondary-r", Refresh, Some("Give && !Terminal")),
                 KeyBinding::new("secondary-enter", Commit, Some("Give && !Terminal")),
@@ -267,12 +251,17 @@ fn main() {
             cx.set_menus(vec![
                 Menu {
                     name: "give".into(),
-                    items: vec![MenuItem::action("Quit give", Quit)],
+                    items: vec![
+                        MenuItem::action("Settings…", OpenSettings),
+                        MenuItem::separator(),
+                        MenuItem::action("Quit give", Quit),
+                    ],
                 },
                 Menu {
                     name: "File".into(),
                     items: vec![
                         MenuItem::action("Open Repository…", OpenRepository),
+                        MenuItem::action("Settings…", OpenSettings),
                         MenuItem::action("Refresh", Refresh),
                         MenuItem::action("Close Preview", ClosePreview),
                     ],
@@ -316,6 +305,15 @@ fn main() {
                         cx.new(|cx| ui::Give::new(initial.clone(), review.clone(), window, cx));
                     let project_view = view.downgrade();
                     let project_window = window.window_handle();
+                    cx.on_action(move |_: &OpenSettings, cx| {
+                        cx.defer(move |cx| {
+                            let _ = project_window.update(cx, |_, window, cx| {
+                                cx.activate(true);
+                                window.activate_window();
+                                settings_view::open(window, cx);
+                            });
+                        });
+                    });
                     cx.on_action(move |action: &OpenRecentProject, cx| {
                         let view = project_view.clone();
                         let path = action.path.clone();
@@ -326,7 +324,7 @@ fn main() {
                                 let _ = view.update(cx, |view, cx| {
                                     cx.activate(true);
                                     window.activate_window();
-                                    view.open(path, window, cx);
+                                    view.request_open(path, window, cx);
                                 });
                             });
                         });

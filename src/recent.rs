@@ -1,8 +1,6 @@
 //! Recently opened projects, newest first, kept in a small JSON list.
 use std::path::{Path, PathBuf};
 
-const LIMIT: usize = 10;
-
 fn home() -> Option<PathBuf> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
@@ -38,7 +36,7 @@ pub fn load(file: &Path) -> Vec<PathBuf> {
         .into_iter()
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
-        .take(LIMIT)
+        .take(crate::settings::current().recent_limit)
         .collect()
 }
 
@@ -55,7 +53,7 @@ pub fn save(file: &Path, projects: &[PathBuf]) -> anyhow::Result<()> {
 pub fn remember(projects: &mut Vec<PathBuf>, project: &Path) {
     projects.retain(|p| p != project);
     projects.insert(0, project.to_path_buf());
-    projects.truncate(LIMIT);
+    projects.truncate(crate::settings::current().recent_limit);
 }
 
 /// The path with the home directory shortened to `~`.
@@ -78,7 +76,7 @@ mod tests {
         for i in 0..20 {
             remember(&mut projects, Path::new(&format!("/p{i}")));
         }
-        assert_eq!(projects.len(), LIMIT);
+        assert_eq!(projects.len(), crate::settings::current().recent_limit);
         assert_eq!(projects[0], PathBuf::from("/p19"));
     }
 

@@ -6,6 +6,7 @@ use give::{
         self, CellFlags, CursorKind, Frame, Mode, SearchMatch, SelectionKind, Size, Terminal,
     },
 };
+use give::{settings, theme};
 use gpui::{prelude::*, *};
 use gpui_component::{
     Sizable, WindowExt,
@@ -21,12 +22,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FONT_SIZE: f32 = 14.;
-/// About Menlo's own line height, so glyphs drawn by the font nearly touch.
-const ROW_HEIGHT: f32 = 17.;
-/// The grid is never narrower than this; a narrower panel scrolls horizontally,
-/// a wider one gets as many columns as fit.
-const MIN_COLUMNS: u16 = 100;
 actions!(
     terminal,
     [
@@ -64,6 +59,7 @@ pub struct TerminalView {
     terminal: Option<Terminal>,
     frame: Option<Arc<Frame>>,
     revision: u64,
+    theme_revision: u64,
     focus: FocusHandle,
     bounds: Rc<Cell<Bounds<Pixels>>>,
     cell_width: f32,
@@ -138,6 +134,7 @@ impl TerminalView {
             terminal: None,
             frame: None,
             revision: 0,
+            theme_revision: theme::revision(),
             focus,
             bounds: Rc::new(Cell::new(Bounds::default())),
             cell_width: 8.4,
@@ -146,7 +143,7 @@ impl TerminalView {
             followed_cursor: None,
             size: Size {
                 rows: 32,
-                cols: MIN_COLUMNS,
+                cols: settings::current().terminal_min_columns,
                 pixel_width: 1008,
                 pixel_height: 672,
             },
@@ -312,7 +309,7 @@ impl TerminalView {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_color(rgb(0x7a8da5))
+                                .text_color(rgb(theme::current().colors.muted))
                                 .child(directory.clone()),
                         ),
                 )
@@ -469,7 +466,7 @@ impl TerminalView {
         }
         let revision = terminal.revision();
         if self.active
-            && revision != self.revision
+            && (revision != self.revision || self.theme_revision != theme::revision())
             && let Some(frame) = terminal.frame()
         {
             self.accessibility.set_value(frame.text.clone());
@@ -482,9 +479,13 @@ impl TerminalView {
             self.accessibility.set_selection(selected, start..end);
             self.frame = Some(Arc::new(frame));
             self.revision = revision;
+            self.theme_revision = theme::revision();
             changed = true;
         }
-        if self.active && self.blink_at.elapsed() >= Duration::from_millis(600) {
+        if self.active
+            && settings::current().cursor_blink
+            && self.blink_at.elapsed() >= Duration::from_millis(600)
+        {
             self.blink = !self.blink;
             self.blink_at = Instant::now();
             changed = true;
@@ -694,7 +695,7 @@ impl TerminalView {
     fn grid_point(&self, position: Point<Pixels>) -> (usize, usize, bool) {
         let bounds = self.bounds.get();
         let x = ((f32::from(position.x - bounds.left()) + self.scroll_x) / self.cell_width).max(0.);
-        let y = (f32::from(position.y - bounds.top()) / ROW_HEIGHT).max(0.);
+        let y = (f32::from(position.y - bounds.top()) / settings::terminal_line_height()).max(0.);
         (
             y.floor().min(self.size.rows.saturating_sub(1) as f32) as usize,
             x.floor().min(self.size.cols.saturating_sub(1) as f32) as usize,
@@ -805,7 +806,9 @@ impl TerminalView {
         self.poll(cx);
     }
     fn wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let delta = event.delta.pixel_delta(px(ROW_HEIGHT));
+        let delta = event
+            .delta
+            .pixel_delta(px(settings::terminal_line_height()));
         if delta.x.abs() > delta.y.abs() {
             // Clamped against the panel width when the grid is next painted.
             self.scroll_x = (self.scroll_x - f32::from(delta.x)).max(0.);
@@ -814,7 +817,12 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        self.wheel += f32::from(event.delta.pixel_delta(px(ROW_HEIGHT)).y) / ROW_HEIGHT;
+        self.wheel += f32::from(
+            event
+                .delta
+                .pixel_delta(px(settings::terminal_line_height()))
+                .y,
+        ) / settings::terminal_line_height();
         let lines = self.wheel.trunc() as i32;
         self.wheel -= lines as f32;
         if lines == 0 {
@@ -890,8 +898,8 @@ impl Render for TerminalView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(terminal::BACKGROUND))
-            .text_color(rgb(terminal::FOREGROUND))
+            .bg(rgb(theme::current().colors.terminal_background))
+            .text_color(rgb(theme::current().colors.terminal_foreground))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
@@ -912,7 +920,7 @@ impl Render for TerminalView {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0x2a394b))
+                    .border_color(rgb(theme::current().colors.border))
                     .text_size(px(12.))
                     .gap_2()
                     .child(
@@ -984,30 +992,32 @@ impl Render for TerminalView {
                                 move |bounds, window, cx| {
                                     bounds_cell.set(bounds);
                                     entity.update(cx, |this, _| {
-                                        let font = gpui::font("Menlo");
+                                        let font = gpui::font(settings::font_family());
                                         let run = TextRun {
                                             len: 1,
                                             font,
-                                            color: rgb(terminal::FOREGROUND).into(),
+                                            color: rgb(theme::current().colors.terminal_foreground)
+                                                .into(),
                                             background_color: None,
                                             underline: None,
                                             strikethrough: None,
                                         };
                                         let line = window.text_system().shape_line(
                                             "M".into(),
-                                            px(FONT_SIZE),
+                                            px(settings::terminal_font_size()),
                                             &[run],
                                             None,
                                         );
                                         this.cell_width = f32::from(line.width).max(1.);
                                         let view_width = f32::from(bounds.size.width);
                                         let cols = ((view_width / this.cell_width).floor() as u16)
-                                            .max(MIN_COLUMNS);
+                                            .max(settings::current().terminal_min_columns);
                                         let grid_width = cols as f32 * this.cell_width;
                                         let size = Size {
-                                            rows: (f32::from(bounds.size.height) / ROW_HEIGHT)
-                                                .floor()
-                                                .max(1.)
+                                            rows: (f32::from(bounds.size.height)
+                                                / settings::terminal_line_height())
+                                            .floor()
+                                            .max(1.)
                                                 as u16,
                                             cols,
                                             pixel_width: grid_width as u16,
@@ -1104,9 +1114,9 @@ impl Render for TerminalView {
                     .flex()
                     .items_center()
                     .border_t_1()
-                    .border_color(rgb(0x2a394b))
+                    .border_color(rgb(theme::current().colors.border))
                     .text_size(px(10.))
-                    .text_color(rgb(0x7a8da5))
+                    .text_color(rgb(theme::current().colors.muted))
                     .child(
                         self.error
                             .clone()
@@ -1153,23 +1163,26 @@ fn paint_scrollbar(
     );
     window.paint_quad(fill(
         thumb,
-        Hsla::from(rgb(0x7a8da5)).opacity(0.5 * opacity),
+        Hsla::from(rgb(theme::current().colors.muted)).opacity(0.5 * opacity),
     ));
 }
 
 fn paint_message(text: &str, origin: Point<Pixels>, window: &mut Window, cx: &mut App) {
     let run = TextRun {
         len: text.len(),
-        font: gpui::font("Menlo"),
-        color: rgb(0xdb929d).into(),
+        font: gpui::font(settings::font_family()),
+        color: rgb(theme::current().colors.red).into(),
         background_color: None,
         underline: None,
         strikethrough: None,
     };
-    let line = window
-        .text_system()
-        .shape_line(text.to_owned().into(), px(FONT_SIZE), &[run], None);
-    let _ = line.paint(origin, px(ROW_HEIGHT), window, cx);
+    let line = window.text_system().shape_line(
+        text.to_owned().into(),
+        px(settings::terminal_font_size()),
+        &[run],
+        None,
+    );
+    let _ = line.paint(origin, px(settings::terminal_line_height()), window, cx);
 }
 
 /// Rectangles snapped to device pixels, so neighbouring cells join without seams.
@@ -1205,7 +1218,11 @@ fn paint_frame(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (focused, blink) = cursor_state;
+    let palette = theme::current();
+    let (focused, blink) = (
+        cursor_state.0,
+        cursor_state.1 || !settings::current().cursor_blink,
+    );
     let cursor = frame
         .cursor
         .filter(|(row, column, _)| *row < frame.rows && *column < frame.columns);
@@ -1215,7 +1232,7 @@ fn paint_frame(
         }
         let position = point(
             bounds.left() + px(cell.column as f32 * width),
-            bounds.top() + px(cell.row as f32 * ROW_HEIGHT),
+            bounds.top() + px(cell.row as f32 * settings::terminal_line_height()),
         );
         let is_cursor = cursor.is_some_and(|(row, col, _)| row == cell.row && col == cell.column);
         let point = alacritty_terminal::index::Point::new(
@@ -1231,12 +1248,12 @@ fn paint_frame(
         let index = matches.partition_point(|m| *m.end() < point);
         let matched = matches.get(index).is_some_and(|m| m.contains(&point));
         let mut background = if cell.selected {
-            0x355575
+            palette.colors.terminal_selection
         } else if matched {
             if Some(index) == current {
-                0x87642c
+                palette.colors.search_active
             } else {
-                0x514931
+                palette.colors.search_match
             }
         } else {
             cell.background
@@ -1246,10 +1263,13 @@ fn paint_frame(
             && blink
             && cursor.is_some_and(|(_, _, shape)| shape == CursorKind::Block)
         {
-            background = 0x87b1d7;
+            background = palette.colors.cursor;
         }
         window.paint_quad(fill(
-            Bounds::new(position, size(px(width), px(ROW_HEIGHT))),
+            Bounds::new(
+                position,
+                size(px(width), px(settings::terminal_line_height())),
+            ),
             rgb(background),
         ));
     }
@@ -1259,14 +1279,14 @@ fn paint_frame(
         }
         let position = point(
             bounds.left() + px(cell.column as f32 * width),
-            bounds.top() + px(cell.row as f32 * ROW_HEIGHT),
+            bounds.top() + px(cell.row as f32 * settings::terminal_line_height()),
         );
         let foreground = if focused
             && blink
             && cursor.is_some_and(|(row, column, shape)| {
                 row == cell.row && column == cell.column && shape == CursorKind::Block
             }) {
-            terminal::BACKGROUND
+            palette.colors.terminal_background
         } else {
             cell.foreground
         };
@@ -1275,12 +1295,13 @@ fn paint_frame(
         }
         let mut chars = cell.text.chars();
         if let (Some(c), None) = (chars.next(), chars.next())
-            && let Some(rects) = give::terminal_glyphs::rects(c, width, ROW_HEIGHT, 1.)
+            && let Some(rects) =
+                give::terminal_glyphs::rects(c, width, settings::terminal_line_height(), 1.)
         {
             paint_cell_rects(&rects, position, foreground, window);
             continue;
         }
-        let mut font = gpui::font("Menlo");
+        let mut font = gpui::font(settings::font_family());
         if cell.flags.contains(CellFlags::BOLD) {
             font.weight = FontWeight::BOLD;
         }
@@ -1307,43 +1328,48 @@ fn paint_frame(
                 },
             ),
         };
-        let line =
-            window
-                .text_system()
-                .shape_line(cell.text.clone().into(), px(FONT_SIZE), &[run], None);
-        let _ = line.paint(position, px(ROW_HEIGHT), window, cx);
+        let line = window.text_system().shape_line(
+            cell.text.clone().into(),
+            px(settings::terminal_font_size()),
+            &[run],
+            None,
+        );
+        let _ = line.paint(position, px(settings::terminal_line_height()), window, cx);
     }
     if let Some((row, column, shape)) = cursor {
         let pos = point(
             bounds.left() + px(column as f32 * width),
-            bounds.top() + px(row as f32 * ROW_HEIGHT),
+            bounds.top() + px(row as f32 * settings::terminal_line_height()),
         );
         if focused && blink {
             let caret = match shape {
-                CursorKind::Beam => Some(Bounds::new(pos, size(px(2.), px(ROW_HEIGHT)))),
+                CursorKind::Beam => Some(Bounds::new(
+                    pos,
+                    size(px(2.), px(settings::terminal_line_height())),
+                )),
                 CursorKind::Underline => Some(Bounds::new(
-                    point(pos.x, pos.y + px(ROW_HEIGHT - 2.)),
+                    point(pos.x, pos.y + px(settings::terminal_line_height() - 2.)),
                     size(px(width), px(2.)),
                 )),
                 _ => None,
             };
             if let Some(caret) = caret {
-                window.paint_quad(fill(caret, rgb(0x87b1d7)));
+                window.paint_quad(fill(caret, rgb(palette.colors.cursor)));
             }
         } else if !focused {
             for rect in [
                 Bounds::new(pos, size(px(width), px(1.))),
-                Bounds::new(pos, size(px(1.), px(ROW_HEIGHT))),
+                Bounds::new(pos, size(px(1.), px(settings::terminal_line_height()))),
                 Bounds::new(
-                    point(pos.x, pos.y + px(ROW_HEIGHT - 1.)),
+                    point(pos.x, pos.y + px(settings::terminal_line_height() - 1.)),
                     size(px(width), px(1.)),
                 ),
                 Bounds::new(
                     point(pos.x + px(width - 1.), pos.y),
-                    size(px(1.), px(ROW_HEIGHT)),
+                    size(px(1.), px(settings::terminal_line_height())),
                 ),
             ] {
-                window.paint_quad(fill(rect, rgb(0x71859d)));
+                window.paint_quad(fill(rect, rgb(palette.colors.cursor_inactive)));
             }
         }
         if !preedit.is_empty() {
@@ -1420,9 +1446,9 @@ impl EntityInputHandler for TerminalView {
         Some(Bounds::new(
             point(
                 bounds.left() + px(col as f32 * self.cell_width - self.scroll_x),
-                bounds.top() + px(row as f32 * ROW_HEIGHT),
+                bounds.top() + px(row as f32 * settings::terminal_line_height()),
             ),
-            size(px(self.cell_width), px(ROW_HEIGHT)),
+            size(px(self.cell_width), px(settings::terminal_line_height())),
         ))
     }
     fn character_index_for_point(

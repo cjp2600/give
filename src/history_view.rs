@@ -1,12 +1,10 @@
-use super::{
-    ACCENT, BORDER, MUTED, NAME_ADDED, NAME_DELETED, NAME_MODIFIED, PANEL, RED, SURFACE, TEXT,
-    ui_icon,
-};
+use super::ui_icon;
 use crate::{CopyPath, FirstRow, LastRow, NextFile, PageDown, PageUp, PreviousFile};
 use give::{
     git::Repository,
     history::{self, Commit, Details, Page},
 };
+use give::{settings, theme};
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Sizable,
@@ -15,8 +13,6 @@ use gpui_component::{
 };
 use std::{path::PathBuf, time::Duration};
 
-const PAGE_SIZE: usize = 100;
-
 /// Owns asynchronous history reads independently of the working-tree preview.
 /// A generation guards project/ref switches; an ID guards commit detail reads.
 pub(super) struct HistoryPanel {
@@ -24,6 +20,7 @@ pub(super) struct HistoryPanel {
     visible: bool,
     generation: u64,
     limit: usize,
+    page_size: usize,
     page: Page,
     selected: Option<String>,
     details: Option<Details>,
@@ -40,7 +37,9 @@ impl HistoryPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |view, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(2)).await;
+                cx.background_executor()
+                    .timer(Duration::from_secs(settings::current().refresh_seconds))
+                    .await;
                 if view.update(cx, |this, cx| this.refresh(cx)).is_err() {
                     break;
                 }
@@ -51,7 +50,8 @@ impl HistoryPanel {
             target: None,
             visible: false,
             generation: 0,
-            limit: PAGE_SIZE,
+            limit: settings::current().history_page_size,
+            page_size: settings::current().history_page_size,
             page: Page::default(),
             selected: None,
             details: None,
@@ -77,7 +77,7 @@ impl HistoryPanel {
         if changed {
             self.generation += 1;
             self.target = target;
-            self.limit = PAGE_SIZE;
+            self.limit = settings::current().history_page_size;
             self.page = Page::default();
             self.selected = None;
             self.details = None;
@@ -217,8 +217,12 @@ impl HistoryPanel {
             .gap_2()
             .px_3()
             .h(px(30.))
-            .bg(rgb(if selected { 0x2b425a } else { PANEL }))
-            .hover(|el| el.bg(rgb(SURFACE)))
+            .bg(rgb(if selected {
+                theme::current().colors.selected
+            } else {
+                theme::current().colors.panel
+            }))
+            .hover(|el| el.bg(rgb(theme::current().colors.surface)))
             .cursor_pointer()
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -229,9 +233,9 @@ impl HistoryPanel {
                 div()
                     .w(px(16.))
                     .flex_shrink_0()
-                    .text_color(rgb(ACCENT))
+                    .text_color(rgb(theme::current().colors.accent))
                     .child(if merge {
-                        ui_icon("branch", 13., ACCENT).into_any_element()
+                        ui_icon("branch", 13., theme::current().colors.accent).into_any_element()
                     } else {
                         div().text_size(px(14.)).child("•").into_any_element()
                     }),
@@ -249,8 +253,8 @@ impl HistoryPanel {
                         .max_w(px(145.))
                         .px_1()
                         .rounded_sm()
-                        .bg(rgb(SURFACE))
-                        .text_color(rgb(ACCENT))
+                        .bg(rgb(theme::current().colors.surface))
+                        .text_color(rgb(theme::current().colors.accent))
                         .text_size(px(10.))
                         .truncate()
                         .child(commit.references.clone()),
@@ -261,7 +265,7 @@ impl HistoryPanel {
                     .w(px(115.))
                     .flex_shrink_0()
                     .truncate()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme::current().colors.muted))
                     .child(commit.author.clone()),
             )
             .child(
@@ -269,7 +273,7 @@ impl HistoryPanel {
                     .w(px(98.))
                     .flex_shrink_0()
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme::current().colors.muted))
                     .child(short_date(commit)),
             )
             .child(
@@ -278,7 +282,7 @@ impl HistoryPanel {
                     .flex_shrink_0()
                     .font_family("Menlo")
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme::current().colors.muted))
                     .child(short_id(&commit.id)),
             )
     }
@@ -296,7 +300,7 @@ impl HistoryPanel {
             .min_w(px(260.))
             .h_full()
             .border_l_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(theme::current().colors.border))
             .when_some(commit, |el, commit| {
                 let identity = format!("{} <{}> · {}", commit.author, commit.email, commit.date);
                 let id = commit.id.clone();
@@ -305,7 +309,7 @@ impl HistoryPanel {
                         .px_3()
                         .py_2()
                         .border_b_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(theme::current().colors.border))
                         .child(
                             div()
                                 .flex()
@@ -315,7 +319,7 @@ impl HistoryPanel {
                                 .child(
                                     div()
                                         .font_family("Menlo")
-                                        .text_color(rgb(ACCENT))
+                                        .text_color(rgb(theme::current().colors.accent))
                                         .child(short_id(&id)),
                                 )
                                 .child(
@@ -333,7 +337,7 @@ impl HistoryPanel {
                         .child(
                             div()
                                 .text_size(px(10.))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(theme::current().colors.muted))
                                 .truncate()
                                 .child(identity),
                         )
@@ -341,7 +345,7 @@ impl HistoryPanel {
                             el.child(
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(rgb(ACCENT))
+                                    .text_color(rgb(theme::current().colors.accent))
                                     .child("Merge · changes against first parent"),
                             )
                         }),
@@ -363,7 +367,7 @@ impl HistoryPanel {
                         .px_3()
                         .py_1()
                         .text_size(px(10.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(theme::current().colors.muted))
                         .child(format!("CHANGED FILES · {}", details.files.len())),
                 )
                 .child(
@@ -378,9 +382,9 @@ impl HistoryPanel {
                                 .map(|index| {
                                     let file = &details.files[index];
                                     let color = match file.status {
-                                        'A' => NAME_ADDED,
-                                        'D' => NAME_DELETED,
-                                        _ => NAME_MODIFIED,
+                                        'A' => theme::current().colors.added,
+                                        'D' => theme::current().colors.deleted,
+                                        _ => theme::current().colors.modified,
                                     };
                                     let path = file.path.to_string_lossy().into_owned();
                                     let label = file
@@ -408,7 +412,7 @@ impl HistoryPanel {
                                                 .text_color(rgb(color))
                                                 .child(file.status.to_string()),
                                         )
-                                        .child(ui_icon("file", 13., MUTED))
+                                        .child(ui_icon("file", 13., theme::current().colors.muted))
                                         .child(
                                             div()
                                                 .min_w_0()
@@ -432,7 +436,7 @@ impl HistoryPanel {
                 el.child(message("Loading changed files…"))
             })
             .when_some(self.details_error.as_ref(), |el, error| {
-                el.child(message(error.clone()).text_color(rgb(RED)))
+                el.child(message(error.clone()).text_color(rgb(theme::current().colors.red)))
             })
             .when(commit.is_none(), |el| {
                 el.child(message("Select a commit to see its files."))
@@ -442,6 +446,14 @@ impl HistoryPanel {
 
 impl Render for HistoryPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let page_size = settings::current().history_page_size;
+        if self.page_size != page_size {
+            self.page_size = page_size;
+            self.limit = page_size;
+            self.generation += 1;
+            self.loading = false;
+            self.refresh(cx);
+        }
         let label = self
             .target
             .as_ref()
@@ -454,8 +466,8 @@ impl Render for HistoryPanel {
             .flex_col()
             .size_full()
             .min_h_0()
-            .bg(rgb(PANEL))
-            .text_color(rgb(TEXT))
+            .bg(rgb(theme::current().colors.panel))
+            .text_color(rgb(theme::current().colors.text))
             .text_size(px(11.))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.navigate(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousFile, _, cx| this.navigate(-1, cx)))
@@ -477,16 +489,20 @@ impl Render for HistoryPanel {
                     .items_center()
                     .gap_2()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .text_color(rgb(MUTED))
-                    .child(ui_icon("branch", 13., ACCENT))
-                    .child(div().text_color(rgb(TEXT)).child("HISTORY"))
+                    .border_color(rgb(theme::current().colors.border))
+                    .text_color(rgb(theme::current().colors.muted))
+                    .child(ui_icon("branch", 13., theme::current().colors.accent))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::current().colors.text))
+                            .child("HISTORY"),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_color(rgb(ACCENT))
+                            .text_color(rgb(theme::current().colors.accent))
                             .child(label),
                     )
                     .child(
@@ -508,7 +524,7 @@ impl Render for HistoryPanel {
                     ),
             )
             .when_some(self.error.as_ref(), |el, error| {
-                el.child(message(error.clone()).text_color(rgb(RED)))
+                el.child(message(error.clone()).text_color(rgb(theme::current().colors.red)))
             })
             .child(
                 div()
@@ -559,7 +575,7 @@ impl Render for HistoryPanel {
                                         .items_center()
                                         .justify_center()
                                         .border_t_1()
-                                        .border_color(rgb(BORDER))
+                                        .border_color(rgb(theme::current().colors.border))
                                         .child(
                                             Button::new("older-commits")
                                                 .ghost()
@@ -571,7 +587,8 @@ impl Render for HistoryPanel {
                                                 })
                                                 .disabled(self.loading)
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.limit += PAGE_SIZE;
+                                                    this.limit +=
+                                                        settings::current().history_page_size;
                                                     this.refresh(cx);
                                                 })),
                                         ),
@@ -593,6 +610,6 @@ fn message(text: impl Into<SharedString>) -> Div {
     div()
         .px_3()
         .py_2()
-        .text_color(rgb(MUTED))
+        .text_color(rgb(theme::current().colors.muted))
         .child(text.into())
 }

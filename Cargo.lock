@@ -2199,6 +2199,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "resvg",
+ "serde",
  "serde_json",
  "syntect",
  "tempfile",

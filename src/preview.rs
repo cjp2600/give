@@ -1,5 +1,6 @@
 //! Full-file overlay ported from giv's tui/diffview.go and tui/preview.go.
 use crate::git::{Diff, DiffLine, LineKind};
+use crate::theme::SyntaxColor;
 use std::{ops::Range, path::Path, sync::LazyLock};
 use syntect::{
     easy::HighlightLines,
@@ -12,7 +13,7 @@ pub const MAX_LINES: usize = 6000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Highlight {
     pub range: Range<usize>,
-    pub color: u32,
+    pub color: SyntaxColor,
 }
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_nonewlines);
@@ -71,17 +72,17 @@ pub fn highlight(path: &Path, lines: &[DiffLine]) -> Vec<Vec<Highlight>> {
                 .map(|(style, text)| {
                     let start = offset;
                     offset += text.len();
-                    // Muted blue editor palette; preserve distinct token categories.
+                    // Keep token roles independent from the selected color scheme.
                     let color = match (style.foreground.r, style.foreground.g, style.foreground.b) {
-                        (101, 115, 126) => 0x74879c, // comment
-                        (180, 142, 173) => 0xb49adb, // keyword
-                        (163, 190, 140) => 0x9fbea8, // string
-                        (208, 135, 112) => 0xd6bb85, // number
-                        (143, 161, 179) => 0x8cb5d6, // type
-                        (136, 192, 208) => 0x8cb5d6,
-                        (191, 97, 106) => 0xd78b97,
-                        (235, 203, 139) => 0x8db5d0,
-                        _ => 0xcbd5e1,
+                        (101, 115, 126) => SyntaxColor::Comment, // comment
+                        (180, 142, 173) => SyntaxColor::Keyword, // keyword
+                        (163, 190, 140) => SyntaxColor::String,  // string
+                        (208, 135, 112) => SyntaxColor::Number,  // number
+                        (143, 161, 179) => SyntaxColor::Type,    // type
+                        (136, 192, 208) => SyntaxColor::Type,
+                        (191, 97, 106) => SyntaxColor::Variable,
+                        (235, 203, 139) => SyntaxColor::Function,
+                        _ => SyntaxColor::Text,
                     };
                     Highlight {
                         range: start..offset,

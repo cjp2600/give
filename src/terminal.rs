@@ -27,8 +27,6 @@ use std::{
     thread,
 };
 
-pub const BACKGROUND: u32 = 0x172330;
-pub const FOREGROUND: u32 = 0xcbd5e1;
 pub use alacritty_terminal::selection::SelectionType as SelectionKind;
 pub use alacritty_terminal::term::TermMode as Mode;
 pub use alacritty_terminal::term::cell::Flags as CellFlags;
@@ -406,6 +404,10 @@ impl Drop for Terminal {
 }
 
 fn frame(state: &State) -> Frame {
+    frame_with_palette(state, &crate::theme::current())
+}
+
+fn frame_with_palette(state: &State, palette: &crate::theme::Theme) -> Frame {
     let term = &state.term;
     let content = term.renderable_content();
     let display_offset = content.display_offset;
@@ -422,8 +424,8 @@ fn frame(state: &State) -> Frame {
         .display_iter
         .map(|indexed| {
             let cell = indexed.cell;
-            let mut foreground = resolve(cell.fg, content.colors, cell.flags, true);
-            let mut background = resolve(cell.bg, content.colors, cell.flags, false);
+            let mut foreground = resolve(cell.fg, content.colors, cell.flags, true, palette);
+            let mut background = resolve(cell.bg, content.colors, cell.flags, false, palette);
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut foreground, &mut background);
             }
@@ -490,7 +492,13 @@ fn frame(state: &State) -> Frame {
     }
 }
 
-fn resolve(color: Color, overrides: &Colors, flags: Flags, foreground: bool) -> u32 {
+fn resolve(
+    color: Color,
+    overrides: &Colors,
+    flags: Flags,
+    foreground: bool,
+    theme: &crate::theme::Theme,
+) -> u32 {
     let mut index = match color {
         Color::Spec(rgb) => return (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32,
         Color::Indexed(index) => index as usize,
@@ -502,16 +510,16 @@ fn resolve(color: Color, overrides: &Colors, flags: Flags, foreground: bool) -> 
     if let Some(rgb) = overrides[index] {
         return (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32;
     }
-    palette(index)
+    palette_with(index, theme)
 }
 
 pub fn palette(index: usize) -> u32 {
-    const ANSI: [u32; 16] = [
-        0x253242, 0xdd8a98, 0x9ac9ad, 0xd8bd86, 0x87b1d7, 0xb89eda, 0x88c3cc, 0xcbd5e1, 0x71859d,
-        0xf0acb6, 0xb6dfc6, 0xe8d3a8, 0xa7cbed, 0xcfb9ed, 0xa4dce2, 0xf0f4fa,
-    ];
+    palette_with(index, &crate::theme::current())
+}
+
+fn palette_with(index: usize, theme: &crate::theme::Theme) -> u32 {
     match index {
-        0..16 => ANSI[index],
+        0..16 => theme.ansi[index],
         16..232 => {
             let n = index - 16;
             let level = |v| if v == 0 { 0 } else { 55 + 40 * v };
@@ -521,10 +529,10 @@ pub fn palette(index: usize) -> u32 {
             let n = (8 + 10 * (index - 232)) as u32;
             n << 16 | n << 8 | n
         }
-        256 | 267 => FOREGROUND,
-        258 => 0x87b1d7,
-        259..267 => ANSI[index - 259],
-        _ => BACKGROUND,
+        256 | 267 => theme.colors.terminal_foreground,
+        258 => theme.colors.cursor,
+        259..267 => theme.ansi[index - 259],
+        _ => theme.colors.terminal_background,
     }
 }
 
@@ -742,6 +750,23 @@ mod tests {
         query.text.clear();
         assert!(search_matches(&state.term, &query).is_empty());
     }
+    #[test]
+    fn theme_switch_recolors_existing_grid_but_preserves_truecolor_and_text() {
+        let (mut state, _, _) = model(2, 10);
+        parse(&mut state, b"\x1b[31mR\x1b[38;2;12;34;56mT\x1b[0m");
+        let mut text = None;
+        for theme in crate::theme::BUILTINS.iter() {
+            let frame = frame_with_palette(&state, theme);
+            assert_eq!(frame.cells[0].foreground, theme.ansi[1]);
+            assert_eq!(frame.cells[1].foreground, 0x0c2238);
+            assert_eq!(frame.cells[1].background, theme.colors.terminal_background);
+            if let Some(text) = &text {
+                assert_eq!(&frame.text, text);
+            }
+            text = Some(frame.text);
+        }
+    }
+
     #[test]
     fn ansi_colors_unicode_hyperlinks_and_alternate_screen_round_trip() {
         let (mut state, _, events) = model(5, 30);

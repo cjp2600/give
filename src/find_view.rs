@@ -1,5 +1,6 @@
 //! A compact find panel used independently by each preview and terminal.
 use give::search::Query;
+use give::theme;
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Selectable, Sizable,
@@ -100,10 +101,10 @@ impl Render for FindPanel {
             .px_2()
             .py_1()
             .flex_shrink_0()
-            .bg(rgb(0x213143))
+            .bg(rgb(theme::current().colors.surface))
             .border_b_1()
-            .border_color(rgb(0x2a394b))
-            .text_color(rgb(0xcbd5e1))
+            .border_color(rgb(theme::current().colors.border))
+            .text_color(rgb(theme::current().colors.text))
             .text_size(px(11.))
             .on_action(cx.listener(|this, _: &Focus, window, cx| this.focus(window, cx)))
             .on_action(cx.listener(|_, _: &Next, _, cx| cx.emit(Event::Next)))

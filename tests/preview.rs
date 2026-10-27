@@ -1,3 +1,4 @@
+use give::theme::SyntaxColor;
 use give::{
     git::{LineKind, parse_diff},
     preview::{self, MAX_LINES},
@@ -220,8 +221,8 @@ fn syntax_highlights_unicode_with_valid_byte_ranges_and_distinct_colors() {
     for span in &styles[0] {
         assert!(rows[0].text.get(span.range.clone()).is_some());
     }
-    assert!(styles[0].iter().any(|s| s.color == 0xb49adb));
-    assert!(styles[0].iter().any(|s| s.color == 0x74879c));
+    assert!(styles[0].iter().any(|s| s.color == SyntaxColor::Keyword));
+    assert!(styles[0].iter().any(|s| s.color == SyntaxColor::Comment));
 }
 
 #[test]
@@ -237,14 +238,14 @@ fn dart_has_its_own_grammar() {
             .unwrap()
             .color
     };
-    assert_eq!(color("async"), 0xb49adb);
-    assert_eq!(color("return"), 0xb49adb);
-    assert_eq!(color("'hi"), 0x9fbea8);
-    assert_eq!(color("name"), 0x9fbea8);
-    assert_eq!(color("0x1F"), 0xd6bb85);
-    assert_eq!(color("// done"), 0x74879c);
-    assert_eq!(color("Future"), 0x8db5d0);
-    assert_ne!(color("main"), 0xcbd5e1);
+    assert_eq!(color("async"), SyntaxColor::Keyword);
+    assert_eq!(color("return"), SyntaxColor::Keyword);
+    assert_eq!(color("'hi"), SyntaxColor::String);
+    assert_eq!(color("name"), SyntaxColor::String);
+    assert_eq!(color("0x1F"), SyntaxColor::Number);
+    assert_eq!(color("// done"), SyntaxColor::Comment);
+    assert_eq!(color("Future"), SyntaxColor::Function);
+    assert_ne!(color("main"), SyntaxColor::Text);
 }
 
 #[test]
@@ -252,86 +253,105 @@ fn proto3_highlights_declarations_fields_rpcs_and_literals() {
     let cases = [
         (
             "syntax = \"proto3\";",
-            vec![("syntax", 0xb49adb), ("proto3", 0x9fbea8)],
+            vec![
+                ("syntax", SyntaxColor::Keyword),
+                ("proto3", SyntaxColor::String),
+            ],
         ),
         (
             "import public 'common.proto';",
             vec![
-                ("import", 0xb49adb),
-                ("public", 0xb49adb),
-                ("common.proto", 0x9fbea8),
+                ("import", SyntaxColor::Keyword),
+                ("public", SyntaxColor::Keyword),
+                ("common.proto", SyntaxColor::String),
             ],
         ),
-        ("package example.v1;", vec![("package", 0xb49adb)]),
+        (
+            "package example.v1;",
+            vec![("package", SyntaxColor::Keyword)],
+        ),
         (
             "message Request {",
-            vec![("message", 0xb49adb), ("Request", 0x8db5d0)],
+            vec![
+                ("message", SyntaxColor::Keyword),
+                ("Request", SyntaxColor::Function),
+            ],
         ),
         (
             "  optional string name = 1; // имя",
             vec![
-                ("optional", 0xb49adb),
-                ("string", 0xb49adb),
-                ("1", 0xd6bb85),
-                ("имя", 0x74879c),
+                ("optional", SyntaxColor::Keyword),
+                ("string", SyntaxColor::Keyword),
+                ("1", SyntaxColor::Number),
+                ("имя", SyntaxColor::Comment),
             ],
         ),
         (
             "  repeated .example.v1.Item items = 2;",
             vec![
-                ("repeated", 0xb49adb),
-                ("example.v1.Item", 0x8db5d0),
-                ("2", 0xd6bb85),
+                ("repeated", SyntaxColor::Keyword),
+                ("example.v1.Item", SyntaxColor::Function),
+                ("2", SyntaxColor::Number),
             ],
         ),
         (
             "  map<string, bytes> labels = 3;",
             vec![
-                ("map", 0xb49adb),
-                ("string", 0xb49adb),
-                ("bytes", 0xb49adb),
-                ("3", 0xd6bb85),
+                ("map", SyntaxColor::Keyword),
+                ("string", SyntaxColor::Keyword),
+                ("bytes", SyntaxColor::Keyword),
+                ("3", SyntaxColor::Number),
             ],
         ),
-        ("  oneof payload {", vec![("oneof", 0xb49adb)]),
+        ("  oneof payload {", vec![("oneof", SyntaxColor::Keyword)]),
         (
             "  reserved 4 to 9;",
-            vec![("reserved", 0xb49adb), ("to", 0xb49adb), ("9", 0xd6bb85)],
+            vec![
+                ("reserved", SyntaxColor::Keyword),
+                ("to", SyntaxColor::Keyword),
+                ("9", SyntaxColor::Number),
+            ],
         ),
         (
             "enum State { UNKNOWN = 0; }",
-            vec![("enum", 0xb49adb), ("0", 0xd6bb85)],
+            vec![("enum", SyntaxColor::Keyword), ("0", SyntaxColor::Number)],
         ),
-        ("service API {", vec![("service", 0xb49adb)]),
+        ("service API {", vec![("service", SyntaxColor::Keyword)]),
         (
             "  rpc Watch(stream Request) returns (stream Reply);",
             vec![
-                ("rpc", 0xb49adb),
-                ("Watch", 0x8cb5d6),
-                ("stream", 0xb49adb),
-                ("returns", 0xb49adb),
+                ("rpc", SyntaxColor::Keyword),
+                ("Watch", SyntaxColor::Type),
+                ("stream", SyntaxColor::Keyword),
+                ("returns", SyntaxColor::Keyword),
             ],
         ),
         (
             "option deprecated = true;",
-            vec![("option", 0xb49adb), ("true", 0xd6bb85)],
+            vec![
+                ("option", SyntaxColor::Keyword),
+                ("true", SyntaxColor::Number),
+            ],
         ),
         (
             "option (custom.ratio) = -1.5e+2;",
-            vec![("1.5e+2", 0xd6bb85)],
+            vec![("1.5e+2", SyntaxColor::Number)],
         ),
         (
             "/* message hidden = 42; */ int32 count = 5;",
             vec![
-                ("hidden", 0x74879c),
-                ("42", 0x74879c),
-                ("int32", 0xb49adb),
-                ("5;", 0xd6bb85),
+                ("hidden", SyntaxColor::Comment),
+                ("42", SyntaxColor::Comment),
+                ("int32", SyntaxColor::Keyword),
+                ("5;", SyntaxColor::Number),
             ],
         ),
         (
             r#"option (custom.text) = "say \"hi\" // message";"#,
-            vec![("say", 0x9fbea8), ("// message", 0x9fbea8)],
+            vec![
+                ("say", SyntaxColor::String),
+                ("// message", SyntaxColor::String),
+            ],
         ),
     ];
     let source = cases
