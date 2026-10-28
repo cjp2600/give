@@ -158,6 +158,14 @@ pub static BUILTINS: LazyLock<Vec<Arc<Theme>>> = LazyLock::new(|| {
         include_str!("../assets/themes/tokyo-night.json"),
         include_str!("../assets/themes/catppuccin-mocha.json"),
         include_str!("../assets/themes/catppuccin-latte.json"),
+        include_str!("../assets/themes/one-dark.json"),
+        include_str!("../assets/themes/monokai.json"),
+        include_str!("../assets/themes/gruvbox-dark.json"),
+        include_str!("../assets/themes/gruvbox-light.json"),
+        include_str!("../assets/themes/solarized-dark.json"),
+        include_str!("../assets/themes/solarized-light.json"),
+        include_str!("../assets/themes/github-dark.json"),
+        include_str!("../assets/themes/github-light.json"),
     ]
     .into_iter()
     .map(|json| Arc::new(serde_json::from_str(json).expect("valid bundled theme")))
@@ -211,6 +219,71 @@ impl SyntaxColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let luminance = |color: u32| {
+            [16, 8, 0]
+                .into_iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(shift, weight)| {
+                    let channel = ((color >> shift) & 255) as f64 / 255.;
+                    let linear = if channel <= 0.04045 {
+                        channel / 12.92
+                    } else {
+                        ((channel + 0.055) / 1.055).powf(2.4)
+                    };
+                    linear * weight
+                })
+                .sum::<f64>()
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn additional_themes_keep_text_readable_across_surfaces_and_button_states() {
+        for id in [
+            "one-dark",
+            "monokai",
+            "gruvbox-dark",
+            "gruvbox-light",
+            "solarized-dark",
+            "solarized-light",
+            "github-dark",
+            "github-light",
+        ] {
+            let theme = find(id).expect("additional theme is registered");
+            assert_eq!(theme.dark, !id.ends_with("-light"));
+            let p = &theme.colors;
+            for background in [
+                p.background,
+                p.panel,
+                p.surface,
+                p.selected,
+                p.diff_added,
+                p.diff_removed,
+                p.cursor_line,
+            ] {
+                assert!(
+                    contrast(p.text, background) >= 4.5,
+                    "{id}: unreadable body text"
+                );
+            }
+            for background in [p.background, p.panel] {
+                assert!(
+                    contrast(p.muted, background) >= 4.5,
+                    "{id}: unreadable secondary text"
+                );
+            }
+            for background in [p.primary, p.primary_hover, p.primary_active] {
+                assert!(
+                    contrast(p.primary_foreground, background) >= 4.5,
+                    "{id}: unreadable button text"
+                );
+            }
+        }
+    }
+
     #[test]
     fn themes_are_complete_unique_and_tokens_recolor_without_reloading() {
         let mut ids = std::collections::HashSet::new();

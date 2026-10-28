@@ -3294,8 +3294,9 @@ impl Give {
                     .h_full()
                     .flex_shrink_0()
                     .cursor_col_resize()
-                    .bg(rgb(theme::current().colors.border))
-                    .hover(|el| el.bg(rgb(theme::current().colors.accent)))
+                    .border_r_1()
+                    .border_color(rgb(theme::current().colors.border))
+                    .hover(|el| el.border_color(rgb(theme::current().colors.accent)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {

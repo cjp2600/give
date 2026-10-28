@@ -465,6 +465,7 @@ impl Render for SettingsView {
                     .child(
                         div()
                             .id("settings-scroll")
+                            .debug_selector(|| "settings-scroll".into())
                             .flex_1()
                             .min_w_0()
                             .overflow_y_scroll()
@@ -590,6 +591,7 @@ mod tests {
             let give = cx.new(|cx| crate::ui::Give::new(None, None, window, cx));
             Root::new(give, window, cx)
         });
+        cx.simulate_resize(size(px(900.), px(600.)));
         cx.update(|window, cx| open_at(Some(file.clone()), window, cx));
         cx.refresh().unwrap();
         cx.run_until_parked();
@@ -623,6 +625,45 @@ mod tests {
         let saved = Settings::load(&file).unwrap();
         assert_eq!(saved.theme, "catppuccin-latte");
         assert_eq!(settings::current(), saved);
+
+        // Newly added themes below the fold remain selectable in a small window.
+        cx.update(|window, cx| open_at(Some(file.clone()), window, cx));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let gallery = cx.debug_bounds("settings-scroll").unwrap();
+        for _ in 0..5 {
+            if cx
+                .debug_bounds("theme-github-light")
+                .is_some_and(|bounds| gallery.contains(&bounds.center()))
+            {
+                break;
+            }
+            cx.simulate_event(ScrollWheelEvent {
+                position: gallery.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-200.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+        let github = cx.debug_bounds("theme-github-light").unwrap();
+        assert!(gallery.contains(&github.center()));
+        cx.simulate_click(github.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(theme::current().id, "github-light");
+        assert!(!theme::current().dark);
+        assert_eq!(
+            settings::current(),
+            saved,
+            "selection remains a preview until Apply"
+        );
+        let apply = cx.debug_bounds("apply-settings").unwrap();
+        cx.simulate_click(apply.center(), Modifiers::default());
+        cx.run_until_parked();
+        let saved = Settings::load(&file).unwrap();
+        assert_eq!(saved.theme, "github-light");
+        assert_eq!(settings::current(), saved);
+
         // Another instance writes the same file; this running app must follow it.
         cx.update(|_, cx| crate::appearance::watch(file.clone(), cx));
         cx.run_until_parked();
