@@ -5,6 +5,7 @@ pub mod history;
 pub mod path_reference;
 pub mod preview;
 pub mod preview_cache;
+pub mod rcli;
 pub mod recent;
 pub mod review;
 pub mod scrollbar;

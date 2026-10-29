@@ -5,6 +5,7 @@ mod appearance;
 mod find_view;
 mod image_view;
 mod project_launch;
+mod rcli_view;
 mod settings_view;
 mod terminal_view;
 mod ui;
@@ -82,6 +83,7 @@ actions!(
         Quit,
         OpenRepository,
         OpenSettings,
+        OpenRcli,
         Refresh,
         Commit,
         NextFile,
@@ -283,6 +285,10 @@ fn main() {
                         MenuItem::action("Copy Diff", CopyDiff),
                         MenuItem::action("Commit Staged Changes", Commit),
                     ],
+                },
+                Menu {
+                    name: "rcli".into(),
+                    items: vec![MenuItem::action("rcli Panel…", OpenRcli)],
                 },
                 Menu {
                     name: "Review".into(),

@@ -259,6 +259,50 @@ impl TerminalView {
         }
     }
 
+    /// Whether a program other than the shell owns this terminal, such as an agent.
+    pub fn busy(&self) -> bool {
+        self.terminal.as_ref().is_some_and(Terminal::busy)
+    }
+
+    /// The program running in place of the shell, by its process group.
+    pub fn foreground(&self) -> Option<u32> {
+        self.terminal.as_ref().and_then(Terminal::foreground)
+    }
+
+    /// Types `line` and Enter into the shell. Refuses while another program owns the
+    /// terminal, so a command never lands in an agent's prompt.
+    pub fn run_line(&mut self, line: &str, cx: &mut Context<Self>) -> bool {
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\r');
+        match &self.terminal {
+            Some(terminal) if terminal.busy() => return false,
+            Some(terminal) => terminal.write(bytes),
+            None if self.error.is_none() => self.queued.extend(bytes),
+            None => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    /// Opens the quick terminal and runs `line` there, beside the main session.
+    pub fn run_in_quick_terminal(
+        &mut self,
+        line: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.is_quick {
+            return false;
+        }
+        if !self.quick_open {
+            self.open_quick_terminal(window, cx);
+        }
+        let Some(quick) = self.quick_terminal.clone() else {
+            return false;
+        };
+        quick.update(cx, |view, cx| view.run_line(line, cx))
+    }
+
     fn open_quick_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_quick || window.has_active_dialog(cx) {
             return;

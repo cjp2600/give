@@ -1,6 +1,7 @@
 //! Global settings editor. Changes are staged until Apply; themes preview immediately.
 use give::{
-    settings::{self, FontFamily, Settings},
+    rcli::{self, Rcli},
+    settings::{self, FontFamily, RcliAutostart, Settings},
     theme,
 };
 use gpui::{prelude::*, *};
@@ -15,6 +16,15 @@ enum Section {
     Appearance,
     Terminal,
     Workspace,
+    Rcli,
+}
+
+/// The binary the draft's `rcli_path` resolves to.
+#[derive(Clone)]
+enum Probe {
+    Checking,
+    Found { path: PathBuf, version: String },
+    Missing,
 }
 
 #[derive(Clone, Copy)]
@@ -33,10 +43,17 @@ pub struct SettingsView {
     error: Option<String>,
     saving: bool,
     path: Option<PathBuf>,
+    probe: Probe,
+    probe_request: u64,
 }
 
 pub fn open(window: &mut Window, cx: &mut App) {
-    open_at(settings::store(), window, cx);
+    open_at(settings::store(), Section::Appearance, window, cx);
+}
+
+/// Settings at the rcli section, where a missing binary is chosen.
+pub fn open_rcli(window: &mut Window, cx: &mut App) {
+    open_at(settings::store(), Section::Rcli, window, cx);
 }
 
 fn restore_theme(cx: &mut App) {
@@ -45,16 +62,22 @@ fn restore_theme(cx: &mut App) {
     }
 }
 
-fn open_at(path: Option<PathBuf>, window: &mut Window, cx: &mut App) {
+fn open_at(path: Option<PathBuf>, section: Section, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
-    let view = cx.new(|_| SettingsView {
-        draft: settings::current(),
-        section: Section::Appearance,
-        error: None,
-        saving: false,
-        path,
+    let view = cx.new(|cx| {
+        let mut view = SettingsView {
+            draft: settings::current(),
+            section,
+            error: None,
+            saving: false,
+            path,
+            probe: Probe::Checking,
+            probe_request: 0,
+        };
+        view.probe_rcli(cx);
+        view
     });
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
@@ -70,6 +93,55 @@ fn open_at(path: Option<PathBuf>, window: &mut Window, cx: &mut App) {
 }
 
 impl SettingsView {
+    fn probe_rcli(&mut self, cx: &mut Context<Self>) {
+        self.probe_request += 1;
+        let request = self.probe_request;
+        self.probe = Probe::Checking;
+        let configured = self.draft.rcli_path.clone();
+        let task = cx.background_executor().spawn(async move {
+            let path = rcli::locate(&configured)?;
+            let version = Rcli::new(path.clone(), std::env::temp_dir())
+                .version()
+                .map(|version| version.version)
+                .unwrap_or_default();
+            Some((path, version))
+        });
+        cx.spawn(async move |view, cx| {
+            let found = task.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.probe_request == request {
+                    this.probe = match found {
+                        Some((path, version)) => Probe::Found { path, version },
+                        None => Probe::Missing,
+                    };
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn choose_rcli(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose rcli".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            if let Ok(Ok(Some(paths))) = result.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = view.update(cx, |this, cx| {
+                    this.draft.rcli_path = path.to_string_lossy().into_owned();
+                    this.probe_rcli(cx);
+                });
+            }
+        })
+        .detach();
+    }
+
     fn adjust(&mut self, field: Number, delta: i32, cx: &mut Context<Self>) {
         match field {
             Number::TerminalFont => {
@@ -385,6 +457,139 @@ impl SettingsView {
     }
 }
 
+impl SettingsView {
+    fn rcli(&self, cx: &mut Context<Self>) -> Div {
+        let p = &theme::current().colors;
+        let custom = !self.draft.rcli_path.trim().is_empty();
+        let (status, color) = match &self.probe {
+            Probe::Checking => ("Looking for rcli…".to_owned(), p.muted),
+            Probe::Found { path, version } => (
+                if version.is_empty() {
+                    path.display().to_string()
+                } else {
+                    format!("{} · v{version}", path.display())
+                },
+                p.green,
+            ),
+            Probe::Missing if custom => {
+                (format!("Not executable: {}", self.draft.rcli_path), p.red)
+            }
+            Probe::Missing => (
+                "rcli was not found. Choose the rcli binary to enable remote agents.".into(),
+                p.red,
+            ),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(section_heading(
+                "rcli",
+                "Run Claude or Codex on your VPS with live, two-way project sync.",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        row(
+                            "Binary",
+                            if custom {
+                                "Chosen manually."
+                            } else {
+                                "Found automatically on your login shell's PATH."
+                            },
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .when(custom, |el| {
+                                    el.child(
+                                        Button::new("rcli-auto")
+                                            .small()
+                                            .label("Auto-detect")
+                                            .disabled(self.saving)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.draft.rcli_path.clear();
+                                                this.probe_rcli(cx);
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    div().debug_selector(|| "rcli-choose".into()).child(
+                                        Button::new("rcli-choose")
+                                            .small()
+                                            .label("Choose…")
+                                            .when(matches!(self.probe, Probe::Missing), |b| {
+                                                b.primary()
+                                            })
+                                            .disabled(self.saving)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.choose_rcli(window, cx)
+                                            })),
+                                    ),
+                                ),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "rcli-status".into())
+                            .px_3()
+                            .py_2()
+                            .rounded(px(5.))
+                            .bg(rgb(p.panel))
+                            .text_size(px(11.))
+                            .text_color(rgb(color))
+                            .child(status),
+                    ),
+            )
+            .child(
+                row(
+                    "Start when a project opens",
+                    "Runs rcli in the project terminal, or asks which agent to start.",
+                )
+                .child(div().flex().gap_1().children(
+                    RcliAutostart::ALL.into_iter().enumerate().map(|(i, mode)| {
+                        Button::new(("rcli-autostart", i))
+                            .small()
+                            .label(mode.label())
+                            .when(self.draft.rcli_autostart == mode, |button| button.primary())
+                            .disabled(self.saving)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.draft.rcli_autostart = mode;
+                                cx.notify();
+                            }))
+                    }),
+                )),
+            )
+            .child(
+                row(
+                    "Skip agent approvals",
+                    "Starts agents with -y: Claude permissions and Codex sandbox prompts are off.",
+                )
+                .child(
+                    Button::new("rcli-dangerous")
+                        .small()
+                        .label(if self.draft.rcli_dangerous {
+                            "On"
+                        } else {
+                            "Off"
+                        })
+                        .disabled(self.saving)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.draft.rcli_dangerous = !this.draft.rcli_dangerous;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(div().text_size(px(10.)).text_color(rgb(p.muted)).child(
+                "Manage sessions, conversations and the VPS from the rcli menu in the title bar.",
+            ))
+    }
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme::current();
@@ -394,6 +599,7 @@ impl Render for SettingsView {
             Section::Appearance => self.appearance(cx),
             Section::Terminal => self.terminal(cx),
             Section::Workspace => self.workspace(cx),
+            Section::Rcli => self.rcli(cx),
         };
         div()
             .debug_selector(|| "settings-dialog".into())
@@ -429,6 +635,7 @@ impl Render for SettingsView {
                                     (Section::Appearance, "Appearance"),
                                     (Section::Terminal, "Terminal"),
                                     (Section::Workspace, "Workspace"),
+                                    (Section::Rcli, "rcli"),
                                 ]
                                 .into_iter()
                                 .enumerate()
@@ -496,6 +703,7 @@ impl Render for SettingsView {
                             .disabled(self.saving)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.draft = Settings::default();
+                                this.probe_rcli(cx);
                                 crate::appearance::preview(
                                     theme::find(&this.draft.theme).unwrap(),
                                     cx,
@@ -592,7 +800,7 @@ mod tests {
             Root::new(give, window, cx)
         });
         cx.simulate_resize(size(px(900.), px(600.)));
-        cx.update(|window, cx| open_at(Some(file.clone()), window, cx));
+        cx.update(|window, cx| open_at(Some(file.clone()), Section::Appearance, window, cx));
         cx.refresh().unwrap();
         cx.run_until_parked();
         assert!(cx.debug_bounds("settings-dialog").is_some());
@@ -611,7 +819,7 @@ mod tests {
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert_eq!(theme::current().id, original.theme);
 
-        cx.update(|window, cx| open_at(Some(file.clone()), window, cx));
+        cx.update(|window, cx| open_at(Some(file.clone()), Section::Appearance, window, cx));
         cx.refresh().unwrap();
         cx.run_until_parked();
         let latte = cx.debug_bounds("theme-catppuccin-latte").unwrap();
@@ -627,7 +835,7 @@ mod tests {
         assert_eq!(settings::current(), saved);
 
         // Newly added themes below the fold remain selectable in a small window.
-        cx.update(|window, cx| open_at(Some(file.clone()), window, cx));
+        cx.update(|window, cx| open_at(Some(file.clone()), Section::Appearance, window, cx));
         cx.refresh().unwrap();
         cx.run_until_parked();
         let gallery = cx.debug_bounds("settings-scroll").unwrap();

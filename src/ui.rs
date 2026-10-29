@@ -1,9 +1,9 @@
 use crate::{
     ActivateRow, ClosePreview, CollapseRow, Commit, CopyDiff, CopyPath, ExitReview, ExpandRow,
-    Find, FirstRow, LastRow, NextChange, NextFile, OpenRepository, PageDown, PageUp, PickerAccept,
-    PickerBack, PickerCancel, PickerDown, PickerOpenActions, PickerUp, PreviousFile, Refresh,
-    ReviewBranch, SelectAllText, SelectDown, SelectLeft, SelectRight, SelectUp, SwitchPane,
-    ToggleDeletions, ToggleHistory, ToggleSidebar, ToggleTerminal,
+    Find, FirstRow, LastRow, NextChange, NextFile, OpenRcli, OpenRepository, PageDown, PageUp,
+    PickerAccept, PickerBack, PickerCancel, PickerDown, PickerOpenActions, PickerUp, PreviousFile,
+    Refresh, ReviewBranch, SelectAllText, SelectDown, SelectLeft, SelectRight, SelectUp,
+    SwitchPane, ToggleDeletions, ToggleHistory, ToggleSidebar, ToggleTerminal,
 };
 use give::{
     branches,
@@ -55,6 +55,9 @@ const TREE_HEIGHT: f32 = 27.;
 
 #[path = "history_view.rs"]
 mod history_view;
+#[path = "rcli_menu.rs"]
+mod rcli_menu;
+pub(crate) use rcli_menu::Running;
 
 pub struct Give {
     repo: Option<Repository>,
@@ -165,6 +168,7 @@ pub struct Give {
     /// Recently opened project roots, newest first.
     recent: Vec<PathBuf>,
     applied_settings: settings::Settings,
+    rcli: rcli_menu::State,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -396,6 +400,7 @@ impl Give {
                 .map(|file| recent::load(&file))
                 .unwrap_or_default(),
             applied_settings: settings::current(),
+            rcli: rcli_menu::State::default(),
             _subscriptions: subscriptions,
         };
         crate::update_dock_menu(&this.recent, cx);
@@ -404,7 +409,18 @@ impl Give {
             .detach();
         if let Some(path) = initial {
             this.open(path, window, cx);
+        } else {
+            this.rcli_locate(window, cx, |_, _, _| {});
         }
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                if view.update(cx, |this, cx| this.rcli_poll(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor()
@@ -771,6 +787,7 @@ impl Give {
                 this.opening = false;
                 match result {
                     Ok((repo, snapshot)) => {
+                        let new_terminal = !this.terminals.contains_key(&repo.root);
                         window.set_window_title(&format!(
                             "{} — give",
                             repo.root.file_name().unwrap_or_default().to_string_lossy()
@@ -805,6 +822,11 @@ impl Give {
                         this.reset_preview_position();
                         this.activate_project_terminal(window, cx);
                         this.notice = "Watching local changes".into();
+                        if new_terminal {
+                            this.rcli_autostart(window, cx);
+                        } else {
+                            this.rcli_poll(cx);
+                        }
                         if let Some(branch) = this.pending_review.take() {
                             this.start_review(branch, window, cx);
                         } else {
@@ -2804,6 +2826,7 @@ impl Give {
                                 cx.listener(|this, _, window, cx| this.manual_refresh(window, cx)),
                             ),
                     )
+                    .child(self.rcli_button(cx))
                     .child(
                         Button::new("settings")
                             .ghost()
@@ -4589,6 +4612,7 @@ impl Render for Give {
             }
             self.text_layouts.clear();
             self.applied_settings = preferences;
+            self.rcli_settings_changed(window, cx);
         }
         // The last tab can also disappear during a background refresh.
         if self.repo.is_some() && self.selected.is_none() && !self.terminal_visible {
@@ -4654,6 +4678,7 @@ impl Render for Give {
                     this.preview_selecting = false;
                 }),
             )
+            .on_action(cx.listener(|this, _: &OpenRcli, window, cx| this.rcli_open_panel(window, cx)))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_history))

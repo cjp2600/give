@@ -45,6 +45,28 @@ impl FontFamily {
     }
 }
 
+/// What give starts through rcli when a project opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RcliAutostart {
+    Off,
+    Claude,
+    Codex,
+    #[default]
+    Ask,
+}
+impl RcliAutostart {
+    pub const ALL: [Self; 4] = [Self::Ask, Self::Claude, Self::Codex, Self::Off];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::Ask => "Ask",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -58,6 +80,11 @@ pub struct Settings {
     pub show_deletions: bool,
     pub recent_limit: usize,
     pub history_page_size: usize,
+    /// The rcli binary; empty finds it on the login shell's PATH.
+    pub rcli_path: String,
+    pub rcli_autostart: RcliAutostart,
+    /// Start agents with `-y`: no approval prompts.
+    pub rcli_dangerous: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -72,6 +99,9 @@ impl Default for Settings {
             show_deletions: false,
             recent_limit: 10,
             history_page_size: 100,
+            rcli_path: String::new(),
+            rcli_autostart: RcliAutostart::default(),
+            rcli_dangerous: false,
         }
     }
 }

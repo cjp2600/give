@@ -15,7 +15,7 @@ use alacritty_terminal::{
     vte::ansi::{Color, CursorShape, Processor, Rgb},
 };
 use anyhow::{Context, Result};
-use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
     path::Path,
@@ -179,6 +179,8 @@ pub struct Terminal {
     events: mpsc::Receiver<Event>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     size: Arc<AtomicU64>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    shell: Option<u32>,
 }
 
 fn pack_size(size: PtySize) -> u64 {
@@ -222,9 +224,11 @@ impl Terminal {
             .spawn_command(command)
             .context("Could not start the system shell")?;
         let killer = child.clone_killer();
+        let shell = child.process_id();
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         drop(pair.slave);
+        let master = Arc::new(Mutex::new(pair.master));
         let (io, incoming) = mpsc::channel();
         let (ui, events) = mpsc::sync_channel(256);
         let current_size = Arc::new(AtomicU64::new(pack_size(size)));
@@ -266,10 +270,10 @@ impl Terminal {
             })?;
         let model = state.clone();
         let changed = revision.clone();
+        let resizer = master.clone();
         thread::Builder::new()
             .name("give-pty-write".into())
             .spawn(move || {
-                let master = pair.master;
                 while let Ok(command) = incoming.recv() {
                     match command {
                         Io::Write(bytes) => {
@@ -286,7 +290,11 @@ impl Terminal {
                             state.term.resize(GridSize::from(size));
                             state.content_revision += 1;
                             drop(state);
-                            if master.resize(size).is_err() {
+                            let resized = resizer
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .resize(size);
+                            if resized.is_err() {
                                 break;
                             }
                             changed.fetch_add(1, Ordering::Release);
@@ -314,7 +322,35 @@ impl Terminal {
             events,
             killer,
             size: current_size,
+            master,
+            shell,
         })
+    }
+
+    /// Whether the shell has exited or another program owns the terminal, such as
+    /// a running agent; typed commands would then go to that program.
+    pub fn busy(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .exited
+            .is_some()
+            || self.foreground().is_some()
+    }
+
+    /// The process group leading the terminal when it is not the shell.
+    pub fn foreground(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            let leader = self
+                .master
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .process_group_leader()? as u32;
+            (Some(leader) != self.shell).then_some(leader)
+        }
+        #[cfg(not(unix))]
+        None
     }
 
     pub fn revision(&self) -> u64 {
@@ -925,6 +961,39 @@ mod tests {
         assert!(result.text.contains("10 100"), "{:?}", result.text);
         a.write("первый проект\r".as_bytes().to_vec());
         assert!(wait_for(&a, "DONE").text.contains("INPUT:первый проект"));
+    }
+
+    #[test]
+    fn busy_while_a_foreground_job_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-i");
+        command.env("PS1", "READY> ");
+        let shell = Terminal::spawn_command(
+            directory.path(),
+            Size {
+                rows: 12,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 240,
+            },
+            command,
+        )
+        .unwrap();
+        wait_for(&shell, "READY>");
+        assert!(
+            !shell.busy(),
+            "an idle shell at its prompt accepts commands"
+        );
+        shell.write(b"sleep 3\r".to_vec());
+        let until = Instant::now() + Duration::from_secs(2);
+        while !shell.busy() {
+            assert!(
+                Instant::now() < until,
+                "a running job makes the terminal busy"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
