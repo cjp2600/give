@@ -16,3 +16,4 @@ pub mod terminal_glyphs;
 pub mod text_selection;
 pub mod theme;
 pub mod tree;
+pub mod watch;

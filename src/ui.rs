@@ -16,6 +16,7 @@ use give::{
     search::{self, SourceMatch},
     text_selection::{self, Point as TextPoint, Selection as TextSelection},
     tree::{self, RowKind, TreeRow},
+    watch::ProjectWatcher,
 };
 use give::{settings, theme};
 use gpui::{prelude::*, *};
@@ -79,6 +80,7 @@ pub struct Give {
     /// What the open context menu's "Copy path" copies, set by the right-clicked row.
     context_copy: Option<ContextCopy>,
     snapshot: Snapshot,
+    watcher: Option<ProjectWatcher>,
     tree: Vec<TreeRow>,
     tree_cursor: Option<usize>,
     tree_request: u64,
@@ -320,6 +322,7 @@ impl Give {
             history_dragging: false,
             context_copy: None,
             snapshot: Snapshot::default(),
+            watcher: None,
             tree: Vec::new(),
             tree_cursor: None,
             tree_request: 0,
@@ -427,6 +430,32 @@ impl Give {
                     .timer(Duration::from_secs(settings::current().refresh_seconds))
                     .await;
                 if view.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                if view
+                    .update(cx, |this, cx| {
+                        if !this.busy
+                            && !this.opening
+                            && !this.refreshing
+                            && this.review_branch.is_none()
+                            && this
+                                .watcher
+                                .as_ref()
+                                .is_some_and(ProjectWatcher::take_changed)
+                        {
+                            this.refresh(cx);
+                        }
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -775,8 +804,11 @@ impl Give {
         let catalog = self.tree_mode == TreeMode::Catalog;
         let task = cx.background_executor().spawn(async move {
             let repo = Repository::open(&path)?;
+            let watcher = ProjectWatcher::new(&repo.root)
+                .inspect_err(|error| eprintln!("give: filesystem watcher unavailable: {error}"))
+                .ok();
             let snapshot = repo.snapshot_with(catalog)?;
-            anyhow::Ok((repo, snapshot))
+            anyhow::Ok((repo, snapshot, watcher))
         });
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
@@ -786,7 +818,7 @@ impl Give {
                 }
                 this.opening = false;
                 match result {
-                    Ok((repo, snapshot)) => {
+                    Ok((repo, snapshot, watcher)) => {
                         let new_terminal = !this.terminals.contains_key(&repo.root);
                         window.set_window_title(&format!(
                             "{} — give",
@@ -794,6 +826,7 @@ impl Give {
                         ));
                         this.remember_project(repo.root.clone(), cx);
                         this.repo = Some(repo);
+                        this.watcher = watcher;
                         this.cache = PreviewCache::default();
                         this.prefetching.clear();
                         this.syntax_pending.clear();
@@ -3039,6 +3072,8 @@ impl Give {
                                                     };
                                                     let badge = if this.review_branch.is_some() {
                                                         file.index.to_string()
+                                                    } else if file.ignored() {
+                                                        "!".into()
                                                     } else if file.clean() {
                                                         String::new()
                                                     } else if file.untracked() {
@@ -3057,6 +3092,7 @@ impl Give {
                                                 _ => ("file", theme::current().colors.muted, String::new()),
                                             };
                                             let name_color = match &row.kind {
+                                                _ if row.ignored => theme::current().colors.brand,
                                                 RowKind::File(file) => file_name_color(file),
                                                 // Catalog folders holding changes are tinted.
                                                 RowKind::Directory { .. }
@@ -3076,6 +3112,11 @@ impl Give {
                                                 .flex()
                                                 .items_center()
                                                 .bg(rgb(if selected { theme::current().colors.selected } else { theme::current().colors.panel }))
+                                                .when(row.ignored, |el| {
+                                                    el.tooltip(|window, cx| {
+                                                        Tooltip::new("Ignored by Git").build(window, cx)
+                                                    })
+                                                })
                                                 .when(navigable, |el| {
                                                     el.cursor_pointer()
                                                         .hover(|el| el.bg(rgb(theme::current().colors.surface)))
@@ -3172,7 +3213,9 @@ impl Give {
                                                             div()
                                                                 .ml_2()
                                                                 .text_size(px(10.))
-                                                                .text_color(rgb(if row.untracked {
+                                                                .text_color(rgb(if row.ignored {
+                                                                    theme::current().colors.brand
+                                                                } else if row.untracked {
                                                                     theme::current().colors.green
                                                                 } else {
                                                                     theme::current().colors.yellow
@@ -4821,7 +4864,9 @@ fn load_slot(
 /// Untracked (not yet added to Git) is red, deleted grey, newly added green, otherwise
 /// modified blue. Unchanged catalog files keep the plain text color.
 fn file_name_color(file: &ChangedFile) -> u32 {
-    if file.clean() {
+    if file.ignored() {
+        theme::current().colors.brand
+    } else if file.clean() {
         theme::current().colors.text
     } else if file.untracked() || file.conflicted() {
         theme::current().colors.untracked

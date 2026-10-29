@@ -28,7 +28,7 @@ Open a project and the terminal takes the available workspace. Open a file and i
 ## From a working session to a shipped change
 
 1. **Open a repository.** Start your tools or an agent in the project terminal.
-2. **Follow the changes.** The file tree updates as the working tree changes. Switch to **Catalog** to browse every non-ignored project file.
+2. **Follow the changes.** The file tree updates as the working tree changes. Switch to **Catalog** to browse disk files and folders, including hidden and Git-ignored entries (shown in orange with a `!` file badge). Git's internal `.git` entries stay hidden.
 3. **Review in context.** Open file previews, find text, jump between changes, and inspect branch history.
 4. **Commit and publish.** Stage the files you want, write a message, and choose **Commit** or **Commit + Push** from the button's arrow menu.
 

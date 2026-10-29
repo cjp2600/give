@@ -225,6 +225,225 @@ fn commit_rejects_empty_message_and_empty_index() {
 }
 
 #[test]
+fn catalog_includes_ignored_hidden_and_empty_entries_without_changing_git_status() {
+    use give::tree::{self, RowKind};
+    use std::collections::HashSet;
+    let f = Fixture::new();
+    f.write(".gitignore", "cache/\nempty/\n*.log\n!keep.log\n");
+    f.write(".env", "LOCAL=true\n");
+    f.write("keep.log", "visible\n");
+    f.write("ignored\nname.log", "ignored content\n");
+    fs::create_dir_all(f.dir.path().join("cache/nested")).unwrap();
+    fs::create_dir_all(f.dir.path().join("empty")).unwrap();
+    f.write("cache/nested/data.txt", "cache content\n");
+    f.repo.stage(None).unwrap();
+    f.repo.commit("Initial").unwrap();
+    f.write(".env", "LOCAL=false\n");
+
+    let changes = f.repo.snapshot().unwrap();
+    let snapshot = f.repo.snapshot_with(true).unwrap();
+    assert_eq!(snapshot.files, changes.files);
+    for path in [
+        "cache",
+        "cache/nested",
+        "cache/nested/data.txt",
+        "empty",
+        "ignored\nname.log",
+    ] {
+        let file = snapshot.file(Path::new(path)).unwrap();
+        assert!(file.ignored(), "{path}");
+        assert!(!file.changed() && !file.staged() && !file.unstaged() && !file.untracked());
+        assert!(snapshot.versions.contains_key(Path::new(path)));
+    }
+    assert!(!snapshot.file(Path::new("keep.log")).unwrap().ignored());
+    assert!(snapshot.file(Path::new(".env")).unwrap().changed());
+    assert!(
+        !snapshot
+            .catalog
+            .iter()
+            .any(|file| file.path.starts_with(".git"))
+    );
+    let rows = tree::build_catalog(&snapshot.catalog, &HashSet::new(), true);
+    assert!(rows.iter().any(|row| row.path() == Some(Path::new("empty"))
+        && row.ignored
+        && !row.changed
+        && matches!(row.kind, RowKind::Directory { .. })));
+    assert!(
+        rows.iter()
+            .any(|row| row.path() == Some(Path::new("cache/nested/data.txt")) && row.ignored)
+    );
+    assert!(tree::changed_directories(&snapshot.catalog).is_empty());
+    let mut expanded = HashSet::from([PathBuf::from("empty")]);
+    tree::prune_collapsed(&mut expanded, &snapshot.catalog);
+    assert!(expanded.contains(Path::new("empty")));
+
+    let file = snapshot.file(Path::new("cache/nested/data.txt")).unwrap();
+    let preview = f.repo.preview(file, false).unwrap();
+    assert_eq!(preview.lines[0].text, "cache content");
+    assert!(
+        preview
+            .lines
+            .iter()
+            .all(|line| line.kind == LineKind::Context)
+    );
+    assert!(preview.notice.unwrap().contains("Ignored by Git"));
+}
+
+#[test]
+fn catalog_refresh_detects_ignored_creation_edits_renames_and_removal() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let f = Fixture::new();
+    f.initial_commit();
+    f.write(".gitignore", "scratch/\n");
+    let first = f.repo.snapshot_with(true).unwrap();
+    fs::create_dir_all(f.dir.path().join("scratch")).unwrap();
+    f.write("scratch/new.txt", "first\n");
+    let path = f.dir.path().join("scratch/new.txt");
+    fs::File::open(&path)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(100))
+        .unwrap();
+    let second = f.repo.snapshot_with(true).unwrap();
+    assert_ne!(first.catalog, second.catalog);
+    assert!(second.file(Path::new("scratch/new.txt")).unwrap().ignored());
+    f.write("scratch/new.txt", "second\n");
+    fs::File::open(&path)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(101))
+        .unwrap();
+    let third = f.repo.snapshot_with(true).unwrap();
+    assert_eq!(second.catalog, third.catalog);
+    assert_ne!(
+        second.versions[Path::new("scratch/new.txt")],
+        third.versions[Path::new("scratch/new.txt")]
+    );
+    fs::rename(&path, f.dir.path().join("scratch/renamed.txt")).unwrap();
+    let renamed = f.repo.snapshot_with(true).unwrap();
+    assert!(renamed.file(Path::new("scratch/new.txt")).is_none());
+    assert!(
+        renamed
+            .file(Path::new("scratch/renamed.txt"))
+            .unwrap()
+            .ignored()
+    );
+    fs::remove_dir_all(f.dir.path().join("scratch")).unwrap();
+    let removed = f.repo.snapshot_with(true).unwrap();
+    assert_eq!(first.catalog, removed.catalog);
+    assert!(
+        !removed
+            .versions
+            .contains_key(Path::new("scratch/renamed.txt"))
+    );
+}
+
+#[test]
+fn catalog_honors_nested_local_and_global_excludes_and_tracked_files() {
+    let f = Fixture::new();
+    f.initial_commit();
+    f.write(".gitignore", "file.txt\n");
+    fs::create_dir(f.dir.path().join("nested")).unwrap();
+    f.write("nested/.gitignore", "*.txt\n!keep.txt\n");
+    f.write("nested/ignored.txt", "nested\n");
+    f.write("nested/keep.txt", "keep\n");
+    f.write("local.dat", "local\n");
+    fs::write(f.dir.path().join(".git/info/exclude"), "local.dat\n").unwrap();
+    let global = tempfile::NamedTempFile::new().unwrap();
+    fs::write(global.path(), "global.dat\n").unwrap();
+    git(
+        f.dir.path(),
+        &[
+            "config",
+            "core.excludesFile",
+            global.path().to_str().unwrap(),
+        ],
+    );
+    f.write("global.dat", "global\n");
+    let snapshot = f.repo.snapshot_with(true).unwrap();
+    for path in ["nested/ignored.txt", "local.dat", "global.dat"] {
+        assert!(snapshot.file(Path::new(path)).unwrap().ignored(), "{path}");
+    }
+    for path in ["file.txt", "nested/keep.txt"] {
+        assert!(!snapshot.file(Path::new(path)).unwrap().ignored(), "{path}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn catalog_does_not_follow_symlinks_or_recurse_into_git_metadata() {
+    let f = Fixture::new();
+    f.initial_commit();
+    fs::create_dir_all(f.dir.path().join("nested/.git")).unwrap();
+    f.write("nested/.git/internal", "metadata\n");
+    std::os::unix::fs::symlink(f.dir.path(), f.dir.path().join("loop")).unwrap();
+    std::os::unix::fs::symlink("missing", f.dir.path().join("broken")).unwrap();
+    let snapshot = f.repo.snapshot_with(true).unwrap();
+    assert!(!snapshot.file(Path::new("loop")).unwrap().directory);
+    assert!(!snapshot.file(Path::new("broken")).unwrap().directory);
+    assert!(
+        !snapshot
+            .catalog
+            .iter()
+            .any(|file| file.path.starts_with("nested/.git"))
+    );
+}
+
+#[test]
+fn catalog_reads_submodule_disk_entries_and_preserves_literal_names() {
+    let f = Fixture::new();
+    f.initial_commit();
+    let head = git(f.dir.path(), &["rev-parse", "HEAD"]);
+    fs::create_dir(f.dir.path().join("sub")).unwrap();
+    f.write("sub/content.txt", "submodule content\n");
+    git(
+        f.dir.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            head.trim(),
+            "sub",
+        ],
+    );
+    f.write(":(glob)*.txt", "literal name\n");
+    f.write(".gitignore", "*.log\n");
+    f.write(":(glob)*.log", "ignored literal name\n");
+    let snapshot = f.repo.snapshot_with(true).unwrap();
+    assert!(snapshot.file(Path::new("sub/content.txt")).is_some());
+    assert!(snapshot.file(Path::new(":(glob)*.txt")).is_some());
+    assert!(snapshot.file(Path::new(":(glob)*.log")).unwrap().ignored());
+}
+
+#[test]
+fn large_ignored_directories_keep_tracked_exceptions_across_classification_batches() {
+    let f = Fixture::new();
+    fs::create_dir(f.dir.path().join("cache")).unwrap();
+    f.write("cache/tracked.txt", "tracked\n");
+    f.repo.stage(None).unwrap();
+    f.repo.commit("Initial").unwrap();
+    f.write(".gitignore", "cache/\n!cache/keep.txt\n");
+    for i in 0..1100 {
+        f.write(&format!("cache/{i:04}.txt"), "ignored\n");
+    }
+    f.write("cache/keep.txt", "still ignored: parent is excluded\n");
+    let snapshot = f.repo.snapshot_with(true).unwrap();
+    assert!(
+        snapshot
+            .file(Path::new("cache/tracked.txt"))
+            .unwrap()
+            .clean()
+    );
+    assert_eq!(
+        snapshot
+            .catalog
+            .iter()
+            .filter(|file| file.ignored())
+            .count(),
+        1102
+    );
+}
+
+#[test]
 fn live_preview_includes_staged_and_unstaged_changes_over_full_worktree() {
     let f = Fixture::new();
     let original = (1..=30).map(|i| format!("line {i}\n")).collect::<String>();

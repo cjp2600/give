@@ -22,6 +22,7 @@ pub struct TreeRow {
     pub untracked: bool,
     /// The row is a changed file or a directory containing one.
     pub changed: bool,
+    pub ignored: bool,
 }
 
 impl TreeRow {
@@ -47,11 +48,11 @@ struct Node {
 
 impl Node {
     fn leaf(&self) -> bool {
-        self.file.is_some() && self.children.is_empty()
+        self.file.as_ref().is_some_and(|file| !file.directory) && self.children.is_empty()
     }
 
     fn insert(&mut self, file: &ChangedFile) {
-        let changed = !file.clean();
+        let changed = file.changed();
         let mut node = self;
         node.changed |= changed;
         for component in file.path.components() {
@@ -80,6 +81,7 @@ impl Node {
                 rows.push(TreeRow {
                     untracked: untracked || file.untracked(),
                     changed: node.changed,
+                    ignored: file.ignored(),
                     kind: RowKind::File(file),
                     label: name.to_string_lossy().into_owned(),
                     depth,
@@ -93,6 +95,12 @@ impl Node {
             while tip.children.len() == 1 {
                 let (name, child) = tip.children.first_key_value().unwrap();
                 if child.leaf() {
+                    break;
+                }
+                // Keep the boundary between ordinary and ignored directories visible.
+                if tip.file.as_ref().is_some_and(ChangedFile::ignored)
+                    != child.file.as_ref().is_some_and(ChangedFile::ignored)
+                {
                     break;
                 }
                 path.push(name);
@@ -110,6 +118,7 @@ impl Node {
                 depth,
                 untracked,
                 changed: node.changed,
+                ignored: tip.file.as_ref().is_some_and(ChangedFile::ignored),
             });
             if open {
                 tip.append(&path, depth + 1, untracked, expanded, rows);
@@ -137,6 +146,7 @@ pub fn build_tree(files: &[ChangedFile], collapsed: &HashSet<PathBuf>) -> Vec<Tr
                 depth: 0,
                 untracked,
                 changed: false,
+                ignored: false,
             });
         }
         rows.push(TreeRow {
@@ -145,6 +155,7 @@ pub fn build_tree(files: &[ChangedFile], collapsed: &HashSet<PathBuf>) -> Vec<Tr
             depth: 0,
             untracked,
             changed: false,
+            ignored: false,
         });
         root.append(
             Path::new(""),
@@ -183,7 +194,7 @@ pub fn build_catalog(
 pub fn changed_directories(files: &[ChangedFile]) -> HashSet<PathBuf> {
     files
         .iter()
-        .filter(|file| !file.clean())
+        .filter(|file| file.changed())
         .flat_map(|file| file.path.ancestors().skip(1))
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
@@ -196,7 +207,7 @@ pub fn prune_collapsed(collapsed: &mut HashSet<PathBuf>, files: &[ChangedFile]) 
     }
     let valid: HashSet<_> = files
         .iter()
-        .flat_map(|file| file.path.ancestors().skip(1))
+        .flat_map(|file| file.path.ancestors().skip(usize::from(!file.directory)))
         .filter(|path| !path.as_os_str().is_empty())
         .collect();
     collapsed.retain(|dir| valid.contains(dir.as_path()));

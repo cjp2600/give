@@ -170,6 +170,7 @@ pub fn changed_files(repo: &Repository, base: &str, head: &str) -> Result<Vec<Ch
         let path = fields.next().context("Missing path in Git diff")?;
         files.push(ChangedFile {
             path: git::path_from_bytes(path)?,
+            directory: false,
             original_path: None,
             index: match status.first() {
                 Some(b'A') => 'A',

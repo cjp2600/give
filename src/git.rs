@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
@@ -19,6 +19,8 @@ const LINE_LIMIT: usize = 20_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangedFile {
     pub path: PathBuf,
+    /// Explicit disk directories, including empty ones, appear only in the catalog.
+    pub directory: bool,
     pub original_path: Option<PathBuf>,
     pub index: char,
     pub worktree: char,
@@ -26,15 +28,23 @@ pub struct ChangedFile {
 
 impl ChangedFile {
     pub fn staged(&self) -> bool {
-        self.index != ' ' && self.index != '?'
+        self.index != ' ' && self.index != '?' && !self.ignored()
     }
 
     pub fn unstaged(&self) -> bool {
-        self.worktree != ' '
+        self.worktree != ' ' && !self.ignored()
     }
 
     pub fn untracked(&self) -> bool {
         self.index == '?'
+    }
+
+    pub fn ignored(&self) -> bool {
+        self.index == '!' && self.worktree == '!'
+    }
+
+    pub fn changed(&self) -> bool {
+        !self.clean() && !self.ignored() && !self.directory
     }
 
     /// A catalog file without any change.
@@ -64,8 +74,8 @@ impl ChangedFile {
 pub struct Snapshot {
     pub branch: String,
     pub files: Vec<ChangedFile>,
-    /// Every non-ignored project file, sorted by path, with changed files as in
-    /// `files` and clean ones as `'  '`. Empty unless requested.
+    /// Disk files and directories, sorted by path. Ignored entries use `'!!'`;
+    /// changed files retain their Git status. Empty unless requested.
     pub catalog: Vec<ChangedFile>,
     pub versions: HashMap<PathBuf, u64>,
 }
@@ -141,7 +151,7 @@ impl Repository {
         self.snapshot_with(false)
     }
 
-    /// With `catalog`, also lists every tracked and untracked, non-ignored file.
+    /// With `catalog`, also reads disk entries, including ignored and hidden paths.
     pub fn snapshot_with(&self, catalog: bool) -> Result<Snapshot> {
         let raw = run(
             &self.root,
@@ -163,19 +173,7 @@ impl Repository {
         };
         let files = parse_status(&raw)?;
         let catalog = if catalog {
-            let listed = run(
-                &self.root,
-                [
-                    "ls-files",
-                    "-z",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                ],
-                None,
-                false,
-            )?;
-            merge_catalog(&files, &listed)?
+            self.disk_catalog(&files)?
         } else {
             Vec::new()
         };
@@ -185,7 +183,7 @@ impl Repository {
         // Per-file versions invalidate only that file, also when HEAD changes.
         let versions = files
             .iter()
-            .chain(catalog.iter().filter(|file| file.clean()))
+            .chain(catalog.iter().filter(|file| !file.changed()))
             .map(|file| {
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 head.hash(&mut hash);
@@ -206,7 +204,132 @@ impl Repository {
         })
     }
 
+    fn disk_catalog(&self, files: &[ChangedFile]) -> Result<Vec<ChangedFile>> {
+        let mut catalog: HashMap<_, _> = files
+            .iter()
+            .map(|file| (file.path.clone(), file.clone()))
+            .collect();
+        let mut pending = vec![PathBuf::new()];
+        while let Some(parent) = pending.pop() {
+            let entries = match fs::read_dir(self.root.join(&parent)) {
+                Ok(entries) => entries,
+                // A directory may disappear between enumeration and reading it.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("Could not read catalog directory"),
+            };
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                let path = parent.join(entry.file_name());
+                let directory = match entry.file_type() {
+                    Ok(kind) => kind.is_dir(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if directory {
+                    pending.push(path.clone());
+                }
+                // Do not follow symlinks: cycles and paths outside the project stay leaves.
+                catalog
+                    .entry(path.clone())
+                    .and_modify(|file| file.directory = directory)
+                    .or_insert(ChangedFile {
+                        path,
+                        directory,
+                        original_path: None,
+                        index: ' ',
+                        worktree: ' ',
+                    });
+            }
+        }
+        if !catalog.is_empty() {
+            let tracked: HashSet<_> = run(&self.root, ["ls-files", "--cached", "-z"], None, false)?
+                .split(|b| *b == 0)
+                .filter(|path| !path.is_empty())
+                .map(path_from_bytes)
+                .collect::<Result<_>>()?;
+            // Bound each response: ignored build/dependency trees can have many paths.
+            let mut paths: Vec<_> = catalog.keys().cloned().collect();
+            paths.sort();
+            let mut ignored_directories = HashSet::new();
+            for batch in paths.chunks(1024) {
+                let mut input = Vec::new();
+                for path in batch {
+                    let file = catalog.get_mut(path).unwrap();
+                    if tracked.contains(path) || file.changed() {
+                        continue;
+                    }
+                    // Git cannot re-include a file below an excluded directory.
+                    // Reuse that classification for large build/dependency trees.
+                    if path
+                        .ancestors()
+                        .skip(1)
+                        .any(|parent| ignored_directories.contains(parent))
+                    {
+                        file.index = '!';
+                        file.worktree = '!';
+                        continue;
+                    }
+                    // Leading ./ prevents names such as :(glob)* from becoming pathspecs.
+                    input.extend_from_slice(b"./");
+                    input.extend_from_slice(path.as_os_str().as_encoded_bytes());
+                    input.push(0);
+                }
+                if input.is_empty() {
+                    continue;
+                }
+                // Verbose records distinguish negations and preserve unusual names.
+                // Exit 1 means no paths matched, a successful classification.
+                let mut command = git_command(&self.root);
+                // check-ignore accepts literal stdin paths, but rejects this pathspec flag.
+                command.env_remove("GIT_LITERAL_PATHSPECS");
+                command.args([
+                    "check-ignore",
+                    // Permit paths inside checked-out submodules; protect tracked paths below.
+                    "--no-index",
+                    "--stdin",
+                    "-z",
+                    "--verbose",
+                    "--non-matching",
+                ]);
+                let ignored = execute_with_no_match(
+                    command,
+                    "Git",
+                    Some(&input),
+                    Duration::from_secs(15),
+                    true,
+                )?;
+                let fields: Vec<_> = ignored.split(|b| *b == 0).collect();
+                for record in fields.chunks_exact(4) {
+                    let pattern = record[2];
+                    if !pattern.is_empty() && !pattern.starts_with(b"!") {
+                        let path =
+                            path_from_bytes(record[3].strip_prefix(b"./").unwrap_or(record[3]))?;
+                        if !tracked.contains(&path)
+                            && let Some(file) = catalog.get_mut(&path)
+                            && !file.changed()
+                        {
+                            file.index = '!';
+                            file.worktree = '!';
+                            if file.directory {
+                                ignored_directories.insert(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut catalog: Vec<_> = catalog.into_values().collect();
+        catalog.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(catalog)
+    }
+
     pub fn diff(&self, file: &ChangedFile, layer: Layer) -> Result<Diff> {
+        if file.ignored() {
+            return self.preview(file, false);
+        }
         if file.untracked() {
             return self.untracked_diff(&file.path);
         }
@@ -298,7 +421,7 @@ impl Repository {
     pub fn preview_pair(&self, file: &ChangedFile) -> Result<(Diff, Diff)> {
         use crate::preview;
         let mut diff = Diff::default();
-        let new_file = file.untracked() || file.index == 'A';
+        let new_file = file.untracked() || file.ignored() || file.index == 'A';
         if !new_file {
             let has_head = run(&self.root, ["rev-parse", "--verify", "HEAD"], None, false).is_ok();
             let mut args: Vec<OsString> =
@@ -350,7 +473,9 @@ impl Repository {
                     if new_file || diff.raw.trim().is_empty() {
                         result.lines = preview::full_context(body);
                         result.notice = Some(
-                            if file.untracked() {
+                            if file.ignored() {
+                                "Ignored by Git — showing file from disk"
+                            } else if file.untracked() {
                                 "Untracked file — showing full content"
                             } else if new_file {
                                 "New file — showing full content"
@@ -455,6 +580,7 @@ pub fn parse_status(raw: &[u8]) -> Result<Vec<ChangedFile>> {
         };
         files.push(ChangedFile {
             path: path_from_bytes(&record[3..])?,
+            directory: false,
             original_path,
             index: record[0] as char,
             worktree: record[1] as char,
@@ -478,6 +604,7 @@ pub fn merge_catalog(files: &[ChangedFile], listed: &[u8]) -> Result<Vec<Changed
         let path = path_from_bytes(record)?;
         catalog.entry(path.clone()).or_insert(ChangedFile {
             path,
+            directory: false,
             original_path: None,
             index: ' ',
             worktree: ' ',
@@ -591,14 +718,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_LITERAL_PATHSPECS", "1")
-        .env("LC_ALL", "C");
+    let mut command = git_command(root);
+    command.args(args);
     execute(
         command,
         "Git",
@@ -607,12 +728,33 @@ where
     )
 }
 
+fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("LC_ALL", "C");
+    command
+}
+
 /// Bounded subprocess with a timeout; stdout and stderr drain concurrently.
 pub(crate) fn execute(
+    command: Command,
+    name: &str,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    execute_with_no_match(command, name, input, timeout, false)
+}
+
+fn execute_with_no_match(
     mut command: Command,
     name: &str,
     input: Option<&[u8]>,
     timeout: Duration,
+    allow_no_match: bool,
 ) -> Result<Vec<u8>> {
     let mut child = command
         .stdin(if input.is_some() {
@@ -649,7 +791,7 @@ pub(crate) fn execute(
         .join()
         .map_err(|_| anyhow::anyhow!("{name} diagnostic reader failed"))??;
     let status = status.with_context(|| format!("{name} operation timed out."))?;
-    if !status.success() {
+    if !(status.success() || allow_no_match && status.code() == Some(1)) {
         let mut detail = String::from_utf8_lossy(&err).trim().to_owned();
         if detail.is_empty() {
             detail = String::from_utf8_lossy(&out).trim().to_owned();

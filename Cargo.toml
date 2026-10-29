@@ -19,6 +19,7 @@ gpui-component = "=0.5.1"
 image = { version = "0.25", default-features = false }
 resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
 wait-timeout = "0.2"
+notify = "8.2"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
