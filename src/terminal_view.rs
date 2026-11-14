@@ -1057,8 +1057,8 @@ impl TerminalView {
     }
 
     fn read_block(&mut self, text: String, window: &Window, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        // Let the menu dismiss before asking VoiceReader to read this clipboard.
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        // Let the menu dismiss before sending this snapshot to Selection TTS.
         // A newer request cancels this one.
         self.read_task = Some(cx.spawn_in(window, async move |view, cx| {
             cx.background_executor()
@@ -1067,10 +1067,10 @@ impl TerminalView {
             #[cfg(not(test))]
             let result = cx
                 .background_executor()
-                .spawn(async { crate::voice_reader::read_clipboard() })
+                .spawn(async move { crate::selection_tts::read(&text) })
                 .await;
             #[cfg(test)]
-            let result = crate::voice_reader::read_clipboard();
+            let result = crate::selection_tts::read(&text);
             let _ = view.update_in(cx, |_, window, cx| {
                 if let Err(message) = result {
                     window.push_notification(Notification::error(message).autohide(false), cx);
@@ -1999,7 +1999,7 @@ mod tests {
     }
 
     fn exercise_block_menu(cx: &mut TestAppContext, read: bool) {
-        let requests = crate::voice_reader::requests();
+        let requests = crate::selection_tts::requests();
         cx.update(|cx| {
             gpui_component::init(cx);
             init(cx);
@@ -2139,12 +2139,21 @@ mod tests {
                 assert!(this.focus.is_focused(window));
             });
         });
-        assert_eq!(crate::voice_reader::requests(), requests);
+        assert_eq!(crate::selection_tts::requests(), requests);
         if read {
+            // The service gets the menu snapshot even if another app changes
+            // the clipboard while the menu is closing.
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string("unrelated clipboard".into()))
+            });
             cx.background_executor
                 .advance_clock(Duration::from_millis(200));
             cx.run_until_parked();
-            assert_eq!(crate::voice_reader::requests(), requests + 1);
+            assert_eq!(crate::selection_tts::requests(), requests + 1);
+            assert_eq!(
+                crate::selection_tts::last_request().as_deref(),
+                Some("first Привет\nsecond")
+            );
             // Replacing a pending request must not fire the reader twice.
             cx.update(|window, cx| {
                 view.update(cx, |this, cx| {
@@ -2156,7 +2165,11 @@ mod tests {
             cx.background_executor
                 .advance_clock(Duration::from_millis(200));
             cx.run_until_parked();
-            assert_eq!(crate::voice_reader::requests(), requests + 2);
+            assert_eq!(crate::selection_tts::requests(), requests + 2);
+            assert_eq!(
+                crate::selection_tts::last_request().as_deref(),
+                Some("newer block")
+            );
             cx.update(|_, cx| {
                 assert_eq!(
                     cx.read_from_clipboard()

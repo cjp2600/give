@@ -7,10 +7,10 @@ mod image_view;
 mod project_launch;
 mod prompt_bar;
 mod rcli_view;
+mod selection_tts;
 mod settings_view;
 mod terminal_view;
 mod ui;
-mod voice_reader;
 
 use gpui::{actions, prelude::*, *};
 use gpui_component::Root;

@@ -42,7 +42,7 @@ Hover over terminal output to softly highlight a block of text. Empty lines sepa
 
 Use **Shift+F10** to open the menu at the terminal cursor. When a terminal program handles mouse input, hold **Shift** while hovering or right-clicking to use give's block controls.
 
-On macOS, **Read block** copies the same block and sends `voicereader://read-clipboard` to **VoiceReader**. VoiceReader starts if needed and reads the clipboard explicitly, independent of its hotkey or current text selection. This requires the updated VoiceReader with the URL handler. The menu closes before the request is sent; give stays in front.
+On macOS, **Read block** also sends the exact block to your installed Selection TTS (`spp`) using `~/.local/bin/read-selection --stdin`. The text stays on the clipboard. This personal integration uses the same speech service as ⌘3, without synthesizing keystrokes or needing Accessibility access for give. A new block replaces the current speech.
 
 ### A second shell, when you need it
 
