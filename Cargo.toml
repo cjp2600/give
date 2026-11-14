@@ -42,8 +42,11 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
-strip = true
+# Keep the symbol table so panic backtraces and crash reports name functions.
+strip = "debuginfo"
 
 # GPUI 0.2.2's xattr dependency still uses a removed Linux libc alias.
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+# Unicode word selection in every native text input (upstream uses ASCII only).
+gpui-component = { path = "vendor/gpui-component" }

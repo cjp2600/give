@@ -1,6 +1,8 @@
 //! GPUI terminal renderer. The PTY and ANSI state live in give::terminal.
 use alacritty_terminal::event::Event;
 use give::{
+    prompt,
+    rcli::Agent,
     search,
     terminal::{
         self, CellFlags, CursorKind, Frame, Mode, SearchMatch, SelectionKind, Size, Terminal,
@@ -11,6 +13,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Sizable, WindowExt,
     button::{Button, ButtonVariants},
+    menu::{PopupMenu, PopupMenuItem},
 };
 use std::{
     cell::Cell,
@@ -28,11 +31,22 @@ actions!(
         TerminalCopy,
         TerminalPaste,
         TerminalSelectAll,
-        CloseQuickTerminal
+        TerminalContextMenu,
+        CloseQuickTerminal,
+        TogglePrompt
     ]
 );
 
 struct QuickTerminalClose;
+
+struct TerminalMenu {
+    view: Entity<PopupMenu>,
+    position: Point<Pixels>,
+    block: Option<Range<usize>>,
+    revision: u64,
+    display_offset: usize,
+    _subscription: Subscription,
+}
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -42,9 +56,41 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-a", TerminalSelectAll, Some("Terminal")),
         KeyBinding::new("ctrl-shift-c", TerminalCopy, Some("Terminal")),
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
+        KeyBinding::new("shift-f10", TerminalContextMenu, Some("Terminal")),
         KeyBinding::new("secondary-w", CloseQuickTerminal, Some("QuickTerminal")),
+        KeyBinding::new("secondary-j", TogglePrompt, Some("Terminal")),
     ]);
+    crate::prompt_bar::init(cx);
 }
+
+/// Clipboard images in the form `give::clipboard_file` saves.
+pub fn clipboard_images(images: Vec<Image>) -> Vec<give::clipboard_file::Image> {
+    images
+        .into_iter()
+        .map(|image| give::clipboard_file::Image {
+            extension: match image.format() {
+                ImageFormat::Png => "png",
+                ImageFormat::Jpeg => "jpg",
+                ImageFormat::Webp => "webp",
+                ImageFormat::Gif => "gif",
+                ImageFormat::Svg => "svg",
+                ImageFormat::Bmp => "bmp",
+                ImageFormat::Tiff => "tiff",
+            },
+            bytes: image.bytes().to_vec(),
+        })
+        .collect()
+}
+
+/// Pauses between the parts of a prompt bar message, so the agent attaches pasted
+/// images and takes the pasted text before Enter submits it.
+const IMAGE_SETTLE: Duration = Duration::from_millis(250);
+const PASTE_SETTLE: Duration = Duration::from_millis(120);
+/// How soon a foreground group without a detected agent is looked up again.
+const AGENT_RETRY: Duration = Duration::from_secs(2);
+
+/// How long the send button waits for the agent to react to Enter.
+const SEND_ECHO: Duration = Duration::from_millis(1500);
 
 enum Input {
     Bytes(Vec<u8>),
@@ -76,6 +122,8 @@ pub struct TerminalView {
     active: bool,
     selecting: bool,
     mouse_button: Option<u8>,
+    hovered: Option<(Point<Pixels>, bool)>,
+    context_menu: Option<TerminalMenu>,
     wheel: f32,
     preedit: String,
     preedit_selection: Range<usize>,
@@ -92,6 +140,17 @@ pub struct TerminalView {
     find_revision: Option<u64>,
     find_pending: bool,
     find_started: Instant,
+    /// The agent owning the terminal, detected from its foreground process group.
+    agent: Option<Agent>,
+    agent_group: Option<u32>,
+    /// When the foreground group was last looked up, while a lookup runs or found
+    /// no agent; it is looked up again after `AGENT_RETRY`.
+    agent_checked: Option<Instant>,
+    prompt: Entity<crate::prompt_bar::PromptBar>,
+    /// Expanded over the agent's own prompt, or folded away to a small pill.
+    prompt_open: bool,
+    /// Focus the prompt bar on the next render; the agent just appeared.
+    prompt_focus_pending: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -101,7 +160,21 @@ impl TerminalView {
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let find = cx.new(|cx| crate::find_view::FindPanel::new(window, cx));
+        let prompt = cx.new(|cx| crate::prompt_bar::PromptBar::new(path.clone(), window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(&prompt, window, |this, _, event, window, cx| {
+                use crate::prompt_bar::Event;
+                match event {
+                    Event::Submit(message) => {
+                        this.deliver(&message.text, &message.images, window, cx)
+                    }
+                    Event::Command(command) => {
+                        this.deliver(&format!("/{}", command.name), &[], window, cx)
+                    }
+                    Event::Interrupt => this.send(b"\x1b".to_vec(), cx),
+                    Event::Collapse => this.set_prompt_open(false, window, cx),
+                }
+            }),
             cx.subscribe_in(&find, window, |this, _, event, window, cx| {
                 match event {
                     crate::find_view::Event::Changed => this.search_terminal(true, cx),
@@ -153,6 +226,8 @@ impl TerminalView {
             active: true,
             selecting: false,
             mouse_button: None,
+            hovered: None,
+            context_menu: None,
             wheel: 0.,
             preedit: String::new(),
             preedit_selection: 0..0,
@@ -169,6 +244,12 @@ impl TerminalView {
             find_revision: None,
             find_pending: false,
             find_started: Instant::now(),
+            agent: None,
+            agent_group: None,
+            agent_checked: None,
+            prompt,
+            prompt_open: true,
+            prompt_focus_pending: false,
             _subscriptions: subscriptions,
         };
         this.launch(cx);
@@ -204,6 +285,8 @@ impl TerminalView {
         self.paste_pending = false;
         self.terminal = None;
         self.frame = None;
+        self.hovered = None;
+        self.context_menu = None;
         self.error = None;
         self.revision = 0;
         let path = self.path.clone();
@@ -255,8 +338,151 @@ impl TerminalView {
         );
         if active {
             self.poll(cx);
+            self.focus_input(window, cx);
+        }
+    }
+
+    fn prompt_visible(&self) -> bool {
+        !self.is_quick && self.agent.is_some()
+    }
+
+    /// Focuses the prompt bar while it covers the agent's prompt, else the terminal.
+    fn focus_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt_visible() && self.prompt_open {
+            self.prompt
+                .update(cx, |prompt, cx| prompt.focus(window, cx));
+        } else {
             self.focus.focus(window);
         }
+    }
+
+    fn set_prompt_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_open = open;
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_prompt(&mut self, _: &TogglePrompt, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt_visible() {
+            self.set_prompt_open(!self.prompt_open, window, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// Looks up the agent when another process group takes over the terminal, and
+    /// again while that group shows none: a lookup between the shell's fork and the
+    /// agent's exec, or a failed `ps`, must not hide the bar for the agent's lifetime.
+    fn watch_agent(&mut self, cx: &mut Context<Self>) {
+        let group = self.foreground();
+        let retry = group.is_some()
+            && self.agent.is_none()
+            && self
+                .agent_checked
+                .is_some_and(|checked| checked.elapsed() >= AGENT_RETRY);
+        if group == self.agent_group && !retry {
+            return;
+        }
+        self.agent_group = group;
+        let Some(group) = group else {
+            self.agent = None;
+            self.agent_checked = None;
+            cx.notify();
+            return;
+        };
+        // Also blocks further retries until this lookup answers.
+        self.agent_checked = None;
+        let task = cx
+            .background_executor()
+            .spawn(async move { prompt::detect_agent(group) });
+        cx.spawn(async move |view, cx| {
+            let agent = task.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.agent_group != Some(group) {
+                    return;
+                }
+                let appeared = this.agent.is_none() && agent.is_some();
+                this.agent = agent;
+                this.agent_checked = agent.is_none().then(Instant::now);
+                if let Some(agent) = agent {
+                    this.prompt
+                        .update(cx, |prompt, cx| prompt.set_agent(agent, cx));
+                }
+                if appeared {
+                    this.prompt_open = true;
+                    this.prompt_focus_pending = true;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Types a prompt bar message into the agent: images as pasted paths, the text as
+    /// one paste, then Enter. A known command is typed as keys so the agent's command
+    /// line opens; one with a picker hands the keyboard to the terminal.
+    fn deliver(
+        &mut self,
+        text: &str,
+        images: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = self.mode();
+        let command = self.agent.and_then(|agent| prompt::command_of(agent, text));
+        let mut parts = Vec::new();
+        if !images.is_empty() {
+            let paths = give::clipboard_file::shell_paths(images);
+            parts.push((terminal::paste_sequence(&paths, mode), IMAGE_SETTLE));
+        }
+        if !text.is_empty() {
+            let bytes = if command.is_some() && images.is_empty() {
+                text.trim().as_bytes().to_vec()
+            } else {
+                terminal::paste_sequence(text, mode)
+            };
+            parts.push((bytes, PASTE_SETTLE));
+        }
+        parts.push((b"\r".to_vec(), Duration::ZERO));
+        if command.is_some_and(|command| command.interactive) {
+            self.set_prompt_open(false, window, cx);
+        }
+        let generation = self.generation;
+        cx.spawn(async move |view, cx| {
+            let mut sent_at = 0;
+            for (bytes, settle) in parts {
+                let Ok(revision) = view.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        this.send(bytes, cx);
+                    }
+                    this.terminal.as_ref().map_or(0, Terminal::revision)
+                }) else {
+                    return;
+                };
+                sent_at = revision;
+                cx.background_executor().timer(settle).await;
+            }
+            let started = Instant::now();
+            while started.elapsed() < SEND_ECHO {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let Ok(revision) = view.update(cx, |this, _| {
+                    this.terminal.as_ref().map_or(0, Terminal::revision)
+                }) else {
+                    return;
+                };
+                if revision != sent_at {
+                    break;
+                }
+            }
+            let _ = view.update(cx, |this, cx| {
+                let error = (this.generation != generation || this.terminal.is_none())
+                    .then(|| "The terminal restarted before the message was sent".to_owned());
+                this.prompt
+                    .update(cx, |prompt, cx| prompt.finish_sending(error, cx));
+            });
+        })
+        .detach();
     }
 
     /// Whether a program other than the shell owns this terminal, such as an agent.
@@ -418,24 +644,9 @@ impl TerminalView {
                 Input::Images(images) => {
                     self.paste_pending = true;
                     let generation = self.generation;
-                    let task = cx.background_executor().spawn(async move {
-                        let images = images
-                            .into_iter()
-                            .map(|image| give::clipboard_file::Image {
-                                extension: match image.format() {
-                                    ImageFormat::Png => "png",
-                                    ImageFormat::Jpeg => "jpg",
-                                    ImageFormat::Webp => "webp",
-                                    ImageFormat::Gif => "gif",
-                                    ImageFormat::Svg => "svg",
-                                    ImageFormat::Bmp => "bmp",
-                                    ImageFormat::Tiff => "tiff",
-                                },
-                                bytes: image.bytes().to_vec(),
-                            })
-                            .collect();
-                        give::clipboard_file::save(images)
-                    });
+                    let task = cx
+                        .background_executor()
+                        .spawn(async move { give::clipboard_file::save(clipboard_images(images)) });
                     cx.spawn(async move |view, cx| {
                         let result = task.await;
                         let _ = view.update(cx, |this, cx| {
@@ -477,6 +688,12 @@ impl TerminalView {
         self.poll(cx);
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
+        if self.terminal.is_none() {
+            return;
+        }
+        if !self.is_quick {
+            self.watch_agent(cx);
+        }
         let Some(terminal) = &self.terminal else {
             return;
         };
@@ -746,6 +963,101 @@ impl TerminalView {
             x.fract() >= 0.5,
         )
     }
+
+    fn highlighted_block(&self) -> Option<Range<usize>> {
+        let frame = self.frame.as_ref()?;
+        if let Some(menu) = &self.context_menu {
+            return (menu.revision == frame.content_revision
+                && menu.display_offset == frame.display_offset)
+                .then(|| menu.block.clone())
+                .flatten();
+        }
+        let (position, shift) = self.hovered?;
+        if self.selecting
+            || !self.bounds.get().contains(&position)
+            || (self.mode().intersects(Mode::MOUSE_MODE) && !shift)
+        {
+            return None;
+        }
+        frame.block_at(self.grid_point(position).0)
+    }
+
+    fn open_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = self.grid_point(position).0;
+        let frame = self.frame.as_ref();
+        let text = frame.and_then(|frame| self.terminal.as_ref()?.block_text(row, frame));
+        let block = text.as_ref().and_then(|_| frame?.block_at(row));
+        let revision = frame.map_or(0, |frame| frame.content_revision);
+        let display_offset = frame.map_or(0, |frame| frame.display_offset);
+        let selection = self.terminal.as_ref().and_then(Terminal::selected_text);
+        let focus = self.focus.clone();
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            menu.action_context(focus)
+                .item(
+                    PopupMenuItem::new("Copy block")
+                        .disabled(text.is_none())
+                        .on_click(move |_, _, cx| {
+                            if let Some(text) = &text {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Copy selection")
+                        .disabled(selection.is_none())
+                        .on_click(move |_, _, cx| {
+                            if let Some(text) = &selection {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            }
+                        }),
+                )
+                .separator()
+                .menu("Paste", Box::new(TerminalPaste))
+                .menu("Select all", Box::new(TerminalSelectAll))
+        });
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu = None;
+            this.hovered = None;
+            cx.notify();
+        });
+        menu.focus_handle(cx).focus(window);
+        self.context_menu = Some(TerminalMenu {
+            view: menu,
+            position,
+            block,
+            revision,
+            display_offset,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn keyboard_context_menu(
+        &mut self,
+        _: &TerminalContextMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(frame) = &self.frame else {
+            return;
+        };
+        let row = frame.cursor.map_or(0, |(row, _, _)| row);
+        let bounds = self.bounds.get();
+        self.open_context_menu(
+            point(
+                bounds.left(),
+                bounds.top() + px(row as f32 * settings::terminal_line_height()),
+            ),
+            window,
+            cx,
+        );
+    }
+
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window);
         cx.stop_propagation();
@@ -784,6 +1096,8 @@ impl TerminalView {
                     mode,
                 ));
             }
+        } else if button == 2 && self.bounds.get().contains(&event.position) {
+            self.open_context_menu(event.position, window, cx);
         } else if button == 0 {
             self.selecting = true;
             let kind = if event.modifiers.alt {
@@ -800,7 +1114,13 @@ impl TerminalView {
                     row,
                     column,
                     half,
-                    if event.modifiers.shift {
+                    // In a mouse-aware program Shift belongs to the terminal:
+                    // it starts a selection rather than extending a missing one.
+                    // Double/triple-click still starts word/line selection.
+                    if event.modifiers.shift
+                        && !mode.intersects(Mode::MOUSE_MODE)
+                        && event.click_count == 1
+                    {
                         None
                     } else {
                         Some(kind)
@@ -811,6 +1131,11 @@ impl TerminalView {
         }
     }
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.highlighted_block();
+        self.hovered = Some((event.position, event.modifiers.shift));
+        if previous != self.highlighted_block() {
+            cx.notify();
+        }
         let (row, column, half) = self.grid_point(event.position);
         let mode = self.mode();
         if self.selecting && event.dragging() {
@@ -907,6 +1232,57 @@ impl TerminalView {
     }
 }
 
+impl TerminalView {
+    /// The prompt bar over the bottom rows, where the agent draws its own prompt, or
+    /// the pill that brings it back.
+    fn render_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = &theme::current().colors;
+        let background = rgb(p.terminal_background);
+        if !self.prompt_open {
+            let label = format!("Message {}  ⌘J", self.agent.map_or("agent", Agent::label));
+            return div()
+                .absolute()
+                .bottom_2()
+                .right_3()
+                .occlude()
+                .child(
+                    Button::new("prompt-open")
+                        .small()
+                        .label(label)
+                        .tooltip("Show the prompt bar")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_prompt_open(true, window, cx)
+                        })),
+                )
+                .into_any_element();
+        }
+        let mut faded: Hsla = background.into();
+        faded.a = 0.;
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .occlude()
+            .cursor_default()
+            .flex()
+            .flex_col()
+            .child(div().h(px(28.)).bg(linear_gradient(
+                0.,
+                linear_color_stop(background, 0.),
+                linear_color_stop(faded, 1.),
+            )))
+            .child(
+                div()
+                    .px_2()
+                    .pb(px(24.))
+                    .bg(background)
+                    .child(self.prompt.clone()),
+            )
+            .into_any_element()
+    }
+}
+
 fn modifiers(m: gpui::Modifiers) -> terminal::Modifiers {
     terminal::Modifiers {
         control: m.control,
@@ -929,9 +1305,18 @@ impl Render for TerminalView {
             self.bounds.get(),
             window,
         );
+        if std::mem::take(&mut self.prompt_focus_pending) {
+            cx.defer_in(window, |this, window, cx| {
+                // Only follow a terminal the user is typing in.
+                if this.active && this.focus.is_focused(window) {
+                    this.focus_input(window, cx);
+                }
+            });
+        }
         let entity = cx.entity();
         let paint_entity = entity.clone();
         let bounds_cell = self.bounds.clone();
+        let prompt = self.prompt_visible().then(|| self.render_prompt(cx));
         div()
             .key_context(if self.is_quick {
                 "Terminal QuickTerminal"
@@ -947,7 +1332,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::keyboard_context_menu))
             .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(Self::toggle_prompt))
             .on_action(cx.listener(|this, _: &CloseQuickTerminal, _, cx| {
                 if this.is_quick {
                     cx.emit(QuickTerminalClose);
@@ -1017,6 +1404,7 @@ impl Render for TerminalView {
             .child(
                 div()
                     .id("terminal-grid")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
@@ -1026,6 +1414,12 @@ impl Render for TerminalView {
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
                     .on_mouse_move(cx.listener(Self::mouse_move))
+                    .on_hover(cx.listener(|this, hovered, _, cx| {
+                        if !hovered {
+                            this.hovered = None;
+                            cx.notify();
+                        }
+                    }))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
                     .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
@@ -1136,7 +1530,7 @@ impl Render for TerminalView {
                                         };
                                     paint_frame(
                                         (&frame, matches, current),
-                                        grid,
+                                        (grid, bounds, view.highlighted_block()),
                                         cell_width,
                                         (focused, blink),
                                         &preedit,
@@ -1148,7 +1542,8 @@ impl Render for TerminalView {
                             )
                             .size_full(),
                         ),
-                    ),
+                    )
+                    .children(prompt),
             )
             .child(
                 div()
@@ -1161,18 +1556,30 @@ impl Render for TerminalView {
                     .border_color(rgb(theme::current().colors.border))
                     .text_size(px(10.))
                     .text_color(rgb(theme::current().colors.muted))
+                    .truncate()
                     .child(
                         self.error
                             .clone()
                             .or_else(|| self.frame.as_ref().and_then(|f| f.exited.clone()))
                             .unwrap_or_else(|| {
                                 format!(
-                                    "{} × {}   ·   ⌘C copy   ⌘V paste",
+                                    "{} × {}   ·   ⌘C copy   ⌘V paste   ·   Right-click to copy block",
                                     self.size.cols, self.size.rows
                                 )
                             }),
                     ),
             )
+            .when_some(self.context_menu.as_ref(), |el, menu| {
+                el.child(
+                    deferred(
+                        anchored()
+                            .position(menu.position)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(menu.view.clone()),
+                    )
+                    .with_priority(1),
+                )
+            })
     }
 }
 
@@ -1255,7 +1662,7 @@ fn paint_cell_rects(
 
 fn paint_frame(
     (frame, matches, current): (&Frame, &[SearchMatch], Option<usize>),
-    bounds: Bounds<Pixels>,
+    (bounds, viewport, block): (Bounds<Pixels>, Bounds<Pixels>, Option<Range<usize>>),
     width: f32,
     cursor_state: (bool, bool),
     preedit: &str,
@@ -1315,6 +1722,23 @@ fn paint_frame(
                 size(px(width), px(settings::terminal_line_height())),
             ),
             rgb(background),
+        ));
+    }
+    if let Some(block) = block {
+        let top = viewport.top() + px(block.start as f32 * settings::terminal_line_height());
+        let height =
+            px(block.len() as f32 * settings::terminal_line_height()).min(viewport.bottom() - top);
+        let area = Bounds::new(
+            point(viewport.left(), top),
+            size(viewport.size.width, height),
+        );
+        window.paint_quad(fill(
+            area,
+            Hsla::from(rgb(palette.colors.terminal_foreground)).opacity(0.045),
+        ));
+        window.paint_quad(fill(
+            Bounds::new(area.origin, size(px(2.), height)),
+            Hsla::from(rgb(palette.colors.accent)).opacity(0.45),
         ));
     }
     for cell in &frame.cells {
@@ -1513,4 +1937,158 @@ fn utf16_offset(text: &str, target: usize) -> usize {
         offset += ch.len_utf16();
     }
     text.len()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use gpui_component::Root;
+    use std::prelude::v1::test;
+
+    #[gpui::test]
+    fn block_menu_copies_snapshot_and_restores_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+            crate::find_view::init(cx);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let terminal_size = Size {
+            rows: 8,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 160,
+        };
+        let terminal = Terminal::spawn(directory.path(), terminal_size).unwrap();
+        terminal.write(
+            "printf '\\033[2J\\033[3J\\033[Hfirst Привет\\r\\nsecond\\r\\n\\r\\nlast\\r\\n'; exec /bin/sleep 30\r"
+                .as_bytes().to_vec(),
+        );
+        let started = Instant::now();
+        let frame = loop {
+            if let Some(frame) = terminal.frame()
+                && frame.text.starts_with("first Привет\nsecond\n\nlast")
+            {
+                break frame;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut view = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let terminal_view = cx.new(|cx| {
+                let mut this = TerminalView::new(directory.path().to_owned(), window, cx);
+                this.generation += 1; // Ignore the shell launch scheduled by new().
+                this.active = false;
+                this.terminal = Some(terminal);
+                this.frame = Some(Arc::new(frame));
+                this.size = terminal_size;
+                this.bounds.set(Bounds::new(
+                    point(px(20.), px(40.)),
+                    size(px(640.), px(160.)),
+                ));
+                this.hovered = Some((point(px(40.), px(45.)), false));
+                assert_eq!(this.highlighted_block(), Some(0..2));
+                this.selecting = true;
+                assert_eq!(this.highlighted_block(), None);
+                this.selecting = false;
+                let mut mouse_frame = this.frame.as_ref().unwrap().as_ref().clone();
+                mouse_frame.mode.insert(Mode::MOUSE_REPORT_CLICK);
+                this.frame = Some(Arc::new(mouse_frame));
+                let position = point(px(20. + this.cell_width * 8.), px(45.));
+                this.mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Modifiers {
+                            shift: true,
+                            ..Default::default()
+                        },
+                        click_count: 2,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    this.terminal
+                        .as_ref()
+                        .and_then(Terminal::selected_text)
+                        .as_deref(),
+                    Some("Привет"),
+                    "Shift + double-click must select words when bypassing tmux mouse input"
+                );
+                this.mouse_up(
+                    &MouseUpEvent {
+                        position,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                this.terminal.as_ref().unwrap().clear_selection();
+                assert_eq!(this.highlighted_block(), None);
+                this.mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Right,
+                        position: point(px(40.), px(45.)),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert!(this.context_menu.is_none());
+                this.hovered.as_mut().unwrap().1 = true;
+                assert_eq!(this.highlighted_block(), Some(0..2));
+                // Shift + right-click opens our menu even for a mouse-aware TUI.
+                this.mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Right,
+                        position: point(px(40.), px(45.)),
+                        modifiers: Modifiers {
+                            shift: true,
+                            ..Default::default()
+                        },
+                        click_count: 1,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert!(this.context_menu.is_some());
+                assert_eq!(this.highlighted_block(), Some(0..2));
+                // The menu retains its original text when later output arrives.
+                let mut changed = this.frame.as_ref().unwrap().as_ref().clone();
+                changed.content_revision += 1;
+                this.frame = Some(Arc::new(changed));
+                assert_eq!(this.highlighted_block(), None);
+                this
+            });
+            view = Some(terminal_view.clone());
+            Root::new(terminal_view, window, cx)
+        });
+        let view = view.unwrap();
+        cx.refresh().unwrap();
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("first Привет\nsecond".into())
+            );
+            view.read_with(cx, |this, _| {
+                assert!(this.context_menu.is_none());
+                assert!(this.focus.is_focused(window));
+            });
+        });
+        cx.simulate_keystrokes("shift-f10");
+        view.read_with(cx, |this, _| assert!(this.context_menu.is_some()));
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            view.read_with(cx, |this, _| {
+                assert!(this.context_menu.is_none());
+                assert!(this.focus.is_focused(window));
+            });
+        });
+    }
 }

@@ -1,0 +1,58 @@
+%YAML 1.2
+---
+name: TOML
+file_extensions: [toml]
+scope: source.toml
+
+variables:
+  bare_key: '[A-Za-z0-9_-]+'
+
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.toml
+    - match: '^\s*(\[\[?)(.*?)(\]\]?)\s*(?=#|$)'
+      captures:
+        1: punctuation.definition.table.begin.toml
+        2: entity.name.section.toml
+        3: punctuation.definition.table.end.toml
+    - match: '{{bare_key}}(?=\s*(?:\.|=))'
+      scope: variable.other.key.toml
+    - include: strings
+    - match: '\b(?:true|false)\b'
+      scope: constant.language.toml
+    - match: '\b\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?)?\b|\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b'
+      scope: constant.other.datetime.toml
+    - match: '[+-]?(?:\b(?:inf|nan)|\b0x[\da-fA-F_]+|\b0o[0-7_]+|\b0b[01_]+|\b\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?)\b'
+      scope: constant.numeric.toml
+
+  strings:
+    - match: '"""'
+      push: multiline_basic
+    - match: "'''"
+      push: multiline_literal
+    - match: '"'
+      push: basic_string
+    - match: "'"
+      push: literal_string
+  escapes:
+    - match: '\\(?:[btnfr"\\]|u[\da-fA-F]{4}|U[\da-fA-F]{8})'
+      scope: constant.character.escape.toml
+  basic_string:
+    - meta_scope: string.quoted.double.toml
+    - include: escapes
+    - match: '"|$'
+      pop: true
+  literal_string:
+    - meta_scope: string.quoted.single.toml
+    - match: "'|$"
+      pop: true
+  multiline_basic:
+    - meta_scope: string.quoted.triple.double.toml
+    - include: escapes
+    - match: '"{3,5}'
+      pop: true
+  multiline_literal:
+    - meta_scope: string.quoted.triple.single.toml
+    - match: "'{3,5}"
+      pop: true

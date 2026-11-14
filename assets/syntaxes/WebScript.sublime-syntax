@@ -1,0 +1,106 @@
+%YAML 1.2
+---
+# Shared modern JavaScript/TypeScript rules, including JSX/TSX expressions.
+name: JavaScript and TypeScript
+file_extensions: [js, mjs, cjs, jsx, ts, mts, cts, tsx]
+scope: source.webscript
+
+variables:
+  ident: '[\p{L}_$][\p{L}\p{N}_$]*'
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - match: '(?<=^|[=(:,!&|?;{}])\s*(/)(?![/*])'
+      captures:
+        1: punctuation.definition.string.begin.js
+      push: regexp
+    - match: '(</?)([A-Za-z][\w.$:-]*)(?=[\s/>])'
+      captures:
+        1: punctuation.definition.tag.begin.js
+        2: entity.name.tag.js
+      push: tag
+    - match: '\b(?:import|from|export|default|as|type|interface|namespace|declare|module|enum|class|extends|implements|abstract|public|private|protected|readonly|static|override|accessor|keyof|typeof|instanceof|infer|is|asserts|satisfies|in|of|new|delete|void|return|throw|try|catch|finally|if|else|for|while|do|switch|case|break|continue|yield|await|async|function|const|let|var|get|set|debugger)\b'
+      scope: keyword.control.js
+    - match: '\b(?:string|number|boolean|bigint|symbol|object|unknown|never|any|undefined)\b'
+      scope: storage.type.js
+    - match: '\b(?:true|false|null|NaN|Infinity)\b'
+      scope: constant.language.js
+    - match: '\b(?:this|super)\b'
+      scope: variable.language.js
+    - match: '\b(?:0[xX][\da-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.[\d_]*)?(?:[eE][+-]?[\d_]+)?n?)\b'
+      scope: constant.numeric.js
+    - match: '\b{{ident}}(?=\s*\()'
+      scope: entity.name.function.js
+    - match: '\b[A-Z][\w$]*\b'
+      scope: support.class.js
+    - match: '=>|\?\.|\?\?|===?|!==?|&&|\|\||[+*%!=?:&|~-]'
+      scope: keyword.operator.js
+
+  comments:
+    - match: '//.*$|^#!.*$'
+      scope: comment.line.double-slash.js
+    - match: '/\*'
+      push: block_comment
+  block_comment:
+    - meta_scope: comment.block.js
+    - match: '\*/'
+      pop: true
+
+  strings:
+    - match: "'"
+      push: single_string
+    - match: '"'
+      push: double_string
+    - match: '`'
+      push: template_string
+  single_string:
+    - meta_scope: string.quoted.single.js
+    - match: '\\.'
+      scope: constant.character.escape.js
+    - match: "'|$"
+      pop: true
+  double_string:
+    - meta_scope: string.quoted.double.js
+    - match: '\\.'
+      scope: constant.character.escape.js
+    - match: '"|$'
+      pop: true
+  template_string:
+    - meta_scope: string.quoted.template.js
+    - match: '\\.'
+      scope: constant.character.escape.js
+    - match: '`'
+      pop: true
+    - match: '\$\{'
+      push: expression
+  expression:
+    - clear_scopes: 1
+    - meta_scope: meta.interpolation.js
+    - match: '\}'
+      pop: true
+    - match: '\{'
+      push: expression
+    - include: main
+
+  regexp:
+    - meta_scope: string.regexp.js
+    - match: '\\.'
+    - match: '\['
+      push:
+        - match: '\\.'
+        - match: '\]'
+          pop: true
+    - match: '/[dgimsuvy]*|$'
+      pop: true
+
+  tag:
+    - match: '/?>'
+      scope: punctuation.definition.tag.end.js
+      pop: true
+    - include: strings
+    - match: '\{'
+      push: expression
+    - match: '[\w:-]+(?=\s*=)'
+      scope: entity.other.attribute-name.js

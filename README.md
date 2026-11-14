@@ -34,6 +34,14 @@ Open a project and the terminal takes the available workspace. Open a file and i
 
 Commits use the existing staged index. Commit + Push publishes the current branch with the same name, using its configured push or tracking remote. If the commit succeeds but push fails, give reports the local commit separately so you can retry the push.
 
+On macOS, select a folder in **Catalog** and press **⌘V** or choose **Paste** from its context menu to copy files from Finder into it. Selecting a file pastes alongside it; a file at the top level targets the project root. Clipboard images without a file become `image.png`, `image.tiff`, or another matching format. Existing names get a numbered suffix. Right-click a catalog file and choose **Delete**, below the separator, to move it to the system Trash.
+
+### Copy terminal output by paragraph
+
+Hover over terminal output to softly highlight a block of text. Empty lines separate blocks; wrapped lines stay together. Right-click and choose **Copy block** to copy the entire paragraph as plain text, including its portion outside the viewport in retained scrollback. Indentation and explicit line breaks are preserved. The menu also offers **Copy selection**, **Paste**, and **Select all**.
+
+Use **Shift+F10** to open the menu at the terminal cursor. When a terminal program handles mouse input, hold **Shift** while hovering or right-clicking to use give's block controls.
+
 ### A second shell, when you need it
 
 Click the terminal icon in the shell header to open **Quick terminal**. Run a test, check a command, or inspect a file while your main process continues. Close the modal with **×**, **⌘W**, or a click outside to return to the main terminal.
@@ -136,6 +144,7 @@ These are the macOS shortcuts. Navigation applies to the focused pane; text fiel
 | **Space** / **Ctrl+N** | Jump to the next change in a source preview |
 | **D** | Show or hide deleted lines |
 | **⌘C** | Copy selected text, a path, or a source reference, depending on focus |
+| **⌘V** | Paste files or a clipboard image into the focused Catalog folder (macOS) |
 
 Open the bottom history panel with **Git** in the status bar or **View → Toggle Git History**.
 
@@ -150,6 +159,8 @@ make icons   # Regenerate application icon exports.
 ```
 
 The UI is rendered natively with GPUI and GPUI Component. The terminal uses Alacritty's terminal engine and portable-pty. Git reads, file loading, and syntax work run in the background; file trees and source previews use virtualized lists.
+
+Source previews include JavaScript and TypeScript (`js`, `jsx`, `mjs`, `cjs`, `ts`, `tsx`, `mts`, `cts`), Astro with embedded scripts and styles, TOML, JSON and JSONC. Multiline comments and strings retain their highlighting when scrolling or showing deleted lines.
 
 | Area | Source |
 | --- | --- |

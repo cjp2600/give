@@ -1,7 +1,7 @@
 //! Bounded, shared previews. Slots coalesce foreground and speculative reads.
 //! `ready` and `styles` never wait; only background workers call `load`/`highlight`.
 use crate::{
-    git::{ChangedFile, Diff, Repository},
+    git::{ChangedFile, Diff, LineKind, Repository},
     preview::{self, Highlight},
 };
 use std::{
@@ -9,7 +9,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -42,6 +42,8 @@ pub struct Slot {
     pub key: Key,
     content: OnceLock<Result<Pair, String>>,
     syntax: OnceLock<(Syntax, Syntax)>,
+    normal_parser: Mutex<preview::HighlightCache>,
+    old_parser: Mutex<preview::HighlightCache>,
     weight: AtomicUsize,
 }
 
@@ -143,20 +145,56 @@ impl Slot {
         })
     }
 
-    /// Only a small visible chunk is tokenized. Unchanged rows share their syntax
-    /// between deletion modes, and OnceLock coalesces overlapping chunk requests.
+    /// Retain spans only for visible chunks. Parser checkpoints preserve context
+    /// across chunks; deleted lines use the old stream without affecting new text.
     pub fn highlight_range(&self, deletions: bool, range: Range<usize>) {
         self.init_syntax();
         let (Some(Ok(pair)), Some(syntax)) = (self.ready(), self.styles(deletions)) else {
             return;
         };
         let diff = pair.mode(deletions);
-        for index in range.start..range.end.min(diff.lines.len()) {
+        let end = range.end.min(diff.lines.len());
+        if range.start >= end || self.range_ready(deletions, range.clone()) {
+            return;
+        }
+        if deletions {
+            // Shared cells always get colors from the current file, never from
+            // removed text that might open a comment, string, or embedded block.
+            let numbers: std::collections::HashSet<_> = diff.lines[range.start..end]
+                .iter()
+                .filter_map(|line| line.new)
+                .collect();
+            let indices: Vec<_> = pair
+                .normal
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, line)| line.new.filter(|n| numbers.contains(n)).map(|_| i))
+                .collect();
+            if let (Some(&start), Some(&last)) = (indices.first(), indices.last()) {
+                self.highlight_range(false, start..last + 1);
+            }
+            if self.range_ready(true, range.start..end) {
+                return;
+            }
+        }
+        let parser = if deletions {
+            &self.old_parser
+        } else {
+            &self.normal_parser
+        };
+        let spans = parser.lock().unwrap().range(
+            &self.key.path,
+            &diff.lines,
+            range.start..end,
+            Some(if deletions {
+                LineKind::Added
+            } else {
+                LineKind::Removed
+            }),
+        );
+        for (index, spans) in (range.start..end).zip(spans) {
             syntax[index].get_or_init(|| {
-                let spans =
-                    preview::highlight(&self.key.path, std::slice::from_ref(&diff.lines[index]))
-                        .pop()
-                        .unwrap_or_default();
                 self.weight.fetch_add(
                     spans.len() * std::mem::size_of::<Highlight>(),
                     Ordering::Relaxed,
@@ -210,6 +248,8 @@ impl PreviewCache {
             key,
             content: OnceLock::new(),
             syntax: OnceLock::new(),
+            normal_parser: Mutex::default(),
+            old_parser: Mutex::default(),
             weight: AtomicUsize::new(0),
         });
         self.slots.push_front(slot.clone());

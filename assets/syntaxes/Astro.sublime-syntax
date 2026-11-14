@@ -1,0 +1,85 @@
+%YAML 1.2
+---
+name: Astro
+file_extensions: [astro]
+scope: text.html.astro
+
+contexts:
+  main:
+    - match: '^---\s*$'
+      scope: punctuation.section.embedded.astro
+      push: frontmatter
+    - match: '<!--'
+      push:
+        - meta_scope: comment.block.html
+        - match: '-->'
+          pop: true
+    - match: '(<)(script)\b'
+      captures:
+        1: punctuation.definition.tag.begin.html
+        2: entity.name.tag.html
+      push: [script, tag]
+    - match: '(<)(style)\b'
+      captures:
+        1: punctuation.definition.tag.begin.html
+        2: entity.name.tag.html
+      push: [style, tag]
+    - match: '(</?)([A-Za-z][\w.:-]*)'
+      captures:
+        1: punctuation.definition.tag.begin.html
+        2: entity.name.tag.html
+      push: tag
+    - match: '\{'
+      push: expression
+    - match: '&(?:[\w]+|#\d+|#x[\da-fA-F]+);'
+      scope: constant.character.entity.html
+
+  frontmatter:
+    - match: '^---\s*$'
+      scope: punctuation.section.embedded.astro
+      pop: true
+    - include: scope:source.webscript
+
+  tag:
+    - match: '/?>'
+      scope: punctuation.definition.tag.end.html
+      pop: true
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.html
+        - match: '"'
+          pop: true
+    - match: "'"
+      push:
+        - meta_scope: string.quoted.single.html
+        - match: "'"
+          pop: true
+    - match: '\{'
+      push: expression
+    - match: '[\w:@.-]+(?=\s*=)'
+      scope: entity.other.attribute-name.html
+
+  expression:
+    - match: '\}'
+      pop: true
+    - match: '\{'
+      push: expression
+    - include: scope:source.webscript
+
+  script:
+    - match: '(</)(script)(\s*>)'
+      captures:
+        1: punctuation.definition.tag.begin.html
+        2: entity.name.tag.html
+        3: punctuation.definition.tag.end.html
+      pop: true
+    - include: scope:source.webscript
+
+  style:
+    - match: '(</)(style)(\s*>)'
+      captures:
+        1: punctuation.definition.tag.begin.html
+        2: entity.name.tag.html
+        3: punctuation.definition.tag.end.html
+      pop: true
+    - include: scope:source.css

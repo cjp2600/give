@@ -226,6 +226,294 @@ fn syntax_highlights_unicode_with_valid_byte_ranges_and_distinct_colors() {
 }
 
 #[test]
+fn toml_and_json_highlight_configuration_values_and_comments() {
+    for (path, source, cases) in [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"Привет\" # comment\nenabled = true\ncount = 42\nwhen = 2026-11-14T12:30:00Z\ntext = \"\"\"first\nsecond # still a string\n\"\"\"\n[[bin]]\npath = 'src/main.rs'",
+            vec![
+                (1, "name", SyntaxColor::Variable),
+                (1, "Привет", SyntaxColor::String),
+                (1, "# comment", SyntaxColor::Comment),
+                (2, "true", SyntaxColor::Number),
+                (3, "42", SyntaxColor::Number),
+                (4, "2026", SyntaxColor::Number),
+                (6, "# still", SyntaxColor::String),
+                (9, "src/main.rs", SyntaxColor::String),
+            ],
+        ),
+        (
+            "package.json",
+            "{\n  \"name\": \"Привет\",\n  \"enabled\": true,\n  \"count\": 42,\n  \"value\": null\n}",
+            vec![
+                (1, "Привет", SyntaxColor::String),
+                (2, "true", SyntaxColor::Number),
+                (3, "42", SyntaxColor::Number),
+                (4, "null", SyntaxColor::Number),
+            ],
+        ),
+        (
+            "tsconfig.json",
+            "{\n // compiler settings\n \"strict\": true\n}",
+            vec![
+                (1, "compiler", SyntaxColor::Comment),
+                (2, "true", SyntaxColor::Number),
+            ],
+        ),
+        (
+            "settings.jsonc",
+            "{\n /* multiline\n comment */\n \"count\": 42\n}",
+            vec![
+                (1, "multiline", SyntaxColor::Comment),
+                (2, "comment", SyntaxColor::Comment),
+                (3, "42", SyntaxColor::Number),
+            ],
+        ),
+    ] {
+        let rows = preview::full_context(source.as_bytes());
+        let styles = preview::highlight(Path::new(path), &rows);
+        for (row, token, expected) in cases {
+            let start = rows[row].text.find(token).unwrap();
+            let color = styles[row]
+                .iter()
+                .find(|span| span.range.contains(&start))
+                .map(|span| span.color);
+            assert_eq!(color, Some(expected), "{path}:{row}: {token}");
+        }
+        for (line, spans) in rows.iter().zip(&styles) {
+            for span in spans {
+                assert!(line.text.get(span.range.clone()).is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn web_languages_highlight_modern_script_and_component_syntax() {
+    let cases = [
+        (
+            "app.ts",
+            "export interface Props { title: string; }",
+            "interface",
+            SyntaxColor::Keyword,
+        ),
+        (
+            "app.mts",
+            "const title: string = 'Привет';",
+            "const",
+            SyntaxColor::Keyword,
+        ),
+        (
+            "app.cts",
+            "export type Count = number;",
+            "type",
+            SyntaxColor::Keyword,
+        ),
+        (
+            "app.js",
+            "export const greet = async () => 'hello';",
+            "async",
+            SyntaxColor::Keyword,
+        ),
+        (
+            "app.mjs",
+            "export const count = 42;",
+            "const",
+            SyntaxColor::Keyword,
+        ),
+        ("app.cjs", "const count = 42;", "42", SyntaxColor::Number),
+        (
+            "App.tsx",
+            "const view = <Card title=\"Привет\" />;",
+            "Привет",
+            SyntaxColor::String,
+        ),
+        (
+            "App.jsx",
+            "const view = <Card title=\"Привет\" />;",
+            "Привет",
+            SyntaxColor::String,
+        ),
+        (
+            "index.astro",
+            "<h1 class=\"title\">Привет</h1>",
+            "title",
+            SyntaxColor::String,
+        ),
+    ];
+    for (path, source, token, expected) in cases {
+        let rows = preview::full_context(source.as_bytes());
+        let styles = preview::highlight(Path::new(path), &rows);
+        let start = source.find(token).unwrap();
+        let color = styles[0]
+            .iter()
+            .find(|span| span.range.contains(&start))
+            .map(|span| span.color);
+        assert_eq!(color, Some(expected), "{path}: {token}");
+        for span in &styles[0] {
+            assert!(
+                source.get(span.range.clone()).is_some(),
+                "{path}: invalid UTF-8 range"
+            );
+        }
+    }
+}
+
+#[test]
+fn astro_preserves_frontmatter_templates_scripts_and_styles_across_rows() {
+    let source = "---\nimport Layout from './Layout.astro';\ninterface Props { title: string; }\nconst greeting = `Привет\nworld ${42}`;\n---\nplain const return\n<Layout title={greeting}>\n<h1 class=\"title\">{true ? greeting : 'fallback'}</h1>\n<script>\nconst enabled = true;\n/* multiline\nreturn is a comment\n*/\nconst count = 12;\n</script>\n<style>\n.title { color: red; }\n</style>\n</Layout>";
+    let rows = preview::full_context(source.as_bytes());
+    let styles = preview::highlight(Path::new("src/pages/index.astro"), &rows);
+    for (row, token, expected) in [
+        (1, "import", SyntaxColor::Keyword),
+        (2, "interface", SyntaxColor::Keyword),
+        (4, "world", SyntaxColor::String),
+        (4, "42", SyntaxColor::Number),
+        (6, "const", SyntaxColor::Text),
+        (8, "title", SyntaxColor::String),
+        (8, "true", SyntaxColor::Number),
+        (10, "const", SyntaxColor::Keyword),
+        (12, "return", SyntaxColor::Comment),
+        (14, "12", SyntaxColor::Number),
+    ] {
+        let start = rows[row].text.find(token).unwrap();
+        let color = styles[row]
+            .iter()
+            .find(|span| span.range.contains(&start))
+            .map(|span| span.color);
+        assert_eq!(color, Some(expected), "line {row}: {token}");
+    }
+    assert!(
+        styles[17]
+            .iter()
+            .any(|span| span.color != SyntaxColor::Text),
+        "embedded CSS must be highlighted"
+    );
+}
+
+#[test]
+fn web_syntax_cache_keeps_multiline_context_when_scrolling_and_toggling_deletions() {
+    use give::{
+        git::Diff,
+        preview_cache::{Key, PreviewCache},
+    };
+    let source = format!(
+        "/*\n{}\n*/\nconst count = 42;",
+        "comment const value\n".repeat(100) + "comment const value"
+    );
+    let rows = preview::full_context(source.as_bytes());
+    let slot = PreviewCache::default().slot(Key {
+        path: "app.ts".into(),
+        version: 1,
+    });
+    slot.load_with(|| {
+        let diff = Diff {
+            lines: rows.clone(),
+            ..Diff::default()
+        };
+        Ok((diff.clone(), diff))
+    })
+    .unwrap();
+    // Start in the middle, then go backwards and forwards across checkpoints.
+    for range in [96..103, 48..55, 100..104, 0..4] {
+        slot.highlight_range(false, range.clone());
+        assert!(slot.range_ready(false, range));
+    }
+    let syntax = slot.styles(false).unwrap();
+    assert!(syntax[20].get().is_none(), "offscreen spans stay lazy");
+    let start = rows[100].text.find("const").unwrap();
+    assert_eq!(
+        syntax[100]
+            .get()
+            .unwrap()
+            .iter()
+            .find(|span| span.range.contains(&start))
+            .unwrap()
+            .color,
+        SyntaxColor::Comment
+    );
+    let last = rows.len() - 1;
+    assert!(
+        syntax[last]
+            .get()
+            .unwrap()
+            .iter()
+            .any(|span| span.color == SyntaxColor::Keyword)
+    );
+
+    // A deleted comment opener affects the old stream, but must not recolor the
+    // current file's shared rows as comments when deletion mode is opened first.
+    let body = b"const current = 42;\n*/\n";
+    let normal = preview::overlay(
+        body,
+        "@@ -1,3 +1,2 @@\n-/*\n const current = 42;\n */\n",
+        false,
+    )
+    .unwrap();
+    let deleted = preview::overlay(
+        body,
+        "@@ -1,3 +1,2 @@\n-/*\n const current = 42;\n */\n",
+        true,
+    )
+    .unwrap();
+    let slot = PreviewCache::default().slot(Key {
+        path: "removed.ts".into(),
+        version: 1,
+    });
+    slot.load_with(|| {
+        Ok((
+            Diff {
+                lines: normal,
+                ..Diff::default()
+            },
+            Diff {
+                lines: deleted,
+                ..Diff::default()
+            },
+        ))
+    })
+    .unwrap();
+    slot.highlight_range(true, 0..3);
+    let normal = slot.styles(false).unwrap();
+    let deleted = slot.styles(true).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&normal[0], &deleted[1]));
+    assert_eq!(normal[0].get().unwrap()[0].color, SyntaxColor::Keyword);
+    assert!(deleted[0].get().is_some());
+}
+
+#[test]
+fn syntax_cache_finishes_fallback_headers_without_parsing_them_as_source() {
+    use give::{
+        git::Diff,
+        preview_cache::{Key, PreviewCache},
+    };
+    let diff = parse_diff(
+        "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-const old = 1;\n+const current = 2;\n",
+    );
+    let normal = preview::fallback(&diff, false);
+    let deleted = preview::fallback(&diff, true);
+    let slot = PreviewCache::default().slot(Key {
+        path: "file.ts".into(),
+        version: 1,
+    });
+    slot.load_with(|| {
+        Ok((
+            Diff {
+                lines: normal,
+                ..Diff::default()
+            },
+            Diff {
+                lines: deleted,
+                ..Diff::default()
+            },
+        ))
+    })
+    .unwrap();
+    slot.highlight_range(true, 0..usize::MAX);
+    assert!(slot.range_ready(true, 0..usize::MAX));
+}
+
+#[test]
 fn dart_has_its_own_grammar() {
     let source = "@override Future<void> main() async { final s = 'hi \\$name ${a.b}'; return 0x1F; } // done";
     let rows = preview::full_context(source.as_bytes());

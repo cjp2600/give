@@ -1,12 +1,12 @@
 use crate::{
     ActivateRow, ClosePreview, CollapseRow, Commit, CopyDiff, CopyPath, ExitReview, ExpandRow,
     Find, FirstRow, LastRow, NextChange, NextFile, OpenRcli, OpenRepository, PageDown, PageUp,
-    PickerAccept, PickerBack, PickerCancel, PickerDown, PickerOpenActions, PickerUp, PreviousFile,
-    Refresh, ReviewBranch, SelectAllText, SelectDown, SelectLeft, SelectRight, SelectUp,
-    SwitchPane, ToggleDeletions, ToggleHistory, ToggleSidebar, ToggleTerminal,
+    PasteFiles, PickerAccept, PickerBack, PickerCancel, PickerDown, PickerOpenActions, PickerUp,
+    PreviousFile, Refresh, ReviewBranch, SelectAllText, SelectDown, SelectLeft, SelectRight,
+    SelectUp, SwitchPane, ToggleDeletions, ToggleHistory, ToggleSidebar, ToggleTerminal,
 };
 use give::{
-    branches,
+    branches, catalog,
     git::{ChangedFile, Diff, LineKind, Repository, Snapshot},
     path_reference, preview,
     preview_cache::{Key, PreviewCache, Slot, Syntax},
@@ -79,6 +79,7 @@ pub struct Give {
     history_dragging: bool,
     /// What the open context menu's "Copy path" copies, set by the right-clicked row.
     context_copy: Option<ContextCopy>,
+    context_catalog: Option<CatalogContext>,
     snapshot: Snapshot,
     watcher: Option<ProjectWatcher>,
     tree: Vec<TreeRow>,
@@ -203,6 +204,14 @@ struct ContextCopy {
     text: String,
 }
 
+/// Capture paths, rather than row indices, while a context menu is open.
+#[derive(Clone)]
+struct CatalogContext {
+    root: PathBuf,
+    directory: PathBuf,
+    file: Option<PathBuf>,
+}
+
 /// A branch picker row: a listed branch, or the typed name as given.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PickerRow {
@@ -321,6 +330,7 @@ impl Give {
             history_height: 300.,
             history_dragging: false,
             context_copy: None,
+            context_catalog: None,
             snapshot: Snapshot::default(),
             watcher: None,
             tree: Vec::new(),
@@ -2465,8 +2475,110 @@ impl Give {
         })
     }
 
-    fn tree_context(&mut self, index: usize) {
+    fn catalog_context(&self, index: Option<usize>) -> Option<CatalogContext> {
+        if !self.catalog() {
+            return None;
+        }
+        let row = index.and_then(|index| self.tree.get(index));
+        let path = row.and_then(TreeRow::path);
+        Some(CatalogContext {
+            root: self.repo.as_ref()?.root.clone(),
+            directory: catalog::paste_directory(
+                path,
+                row.is_some_and(|row| matches!(row.kind, RowKind::Directory { .. })),
+            ),
+            file: row.and_then(|row| match &row.kind {
+                RowKind::File(file) => Some(file.path.clone()),
+                _ => None,
+            }),
+        })
+    }
+
+    fn tree_context(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.context_copy = self.tree_copy(index);
+        self.context_catalog = self.catalog_context(Some(index));
+        self.tree_cursor = Some(index);
+        self.focus_left = true;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn can_edit_catalog(&self, target: &CatalogContext) -> bool {
+        self.catalog()
+            && !self.busy
+            && !self.opening
+            && self
+                .repo
+                .as_ref()
+                .is_some_and(|repo| repo.root == target.root)
+    }
+
+    fn paste_files(&mut self, _: &PasteFiles, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_left || !self.focus.is_focused(window) {
+            return;
+        }
+        if let Some(target) = self.catalog_context(self.tree_cursor) {
+            self.paste_into(target, window, cx);
+        }
+    }
+
+    fn paste_into(&mut self, target: CatalogContext, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_edit_catalog(&target) {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let payload = catalog::read_clipboard();
+        #[cfg(not(target_os = "macos"))]
+        let payload = cx.read_from_clipboard().and_then(|item| {
+            let images = item
+                .into_entries()
+                .filter_map(|entry| match entry {
+                    ClipboardEntry::Image(image) => Some(image),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!images.is_empty())
+                .then(|| catalog::Paste::Images(crate::terminal_view::clipboard_images(images)))
+        });
+        let Some(payload) = payload else {
+            self.show_error("Copy files or an image to paste into the catalog", cx);
+            return;
+        };
+        self.catalog_expanded.extend(
+            target
+                .directory
+                .ancestors()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.to_owned()),
+        );
+        let repo = self.repo.clone().unwrap();
+        self.start_operation("Pasting files…", cx);
+        let task = cx.background_executor().spawn(async move {
+            catalog::paste(&target.root, &target.directory, payload)?;
+            repo.snapshot_with(true)
+        });
+        self.finish_operation(task, "Files pasted", window, cx);
+    }
+
+    fn delete_catalog_file(
+        &mut self,
+        target: CatalogContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit_catalog(&target) {
+            return;
+        }
+        let Some(path) = target.file else {
+            return;
+        };
+        let repo = self.repo.clone().unwrap();
+        self.start_operation("Moving file to Trash…", cx);
+        let task = cx.background_executor().spawn(async move {
+            catalog::trash(&target.root, &path)?;
+            repo.snapshot_with(true)
+        });
+        self.finish_operation(task, "File moved to Trash", window, cx);
     }
 
     /// The selection with its lines when the row is inside it, otherwise that line.
@@ -2530,20 +2642,48 @@ impl Give {
         menu: PopupMenu,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let Some(copy) = view
-            .upgrade()
-            .and_then(|view| view.read(cx).context_copy.clone())
-        else {
+        let Some(entity) = view.upgrade() else {
             return menu;
         };
-        let view = view.clone();
-        menu.item(
-            PopupMenuItem::new(copy.label.clone()).on_click(move |_, _, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    this.write_path(copy.clone(), cx);
-                });
-            }),
-        )
+        let state = entity.read(cx);
+        let copy = state.context_copy.clone();
+        let target = state.context_catalog.clone();
+        let enabled = target
+            .as_ref()
+            .is_some_and(|target| state.can_edit_catalog(target));
+        let mut menu = menu;
+        if let Some(copy) = copy {
+            let view = view.clone();
+            menu = menu.item(
+                PopupMenuItem::new(copy.label.clone()).on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |this, cx| this.write_path(copy.clone(), cx));
+                }),
+            );
+        }
+        if let Some(target) = target {
+            let paste_view = view.clone();
+            let paste_target = target.clone();
+            menu = menu.item(PopupMenuItem::new("Paste").disabled(!enabled).on_click(
+                move |_, window, cx| {
+                    let _ = paste_view.update(cx, |this, cx| {
+                        this.paste_into(paste_target.clone(), window, cx)
+                    });
+                },
+            ));
+            if target.file.is_some() {
+                let delete_view = view.clone();
+                menu = menu.separator().item(
+                    PopupMenuItem::new("Delete").disabled(!enabled).on_click(
+                        move |_, window, cx| {
+                            let _ = delete_view.update(cx, |this, cx| {
+                                this.delete_catalog_file(target.clone(), window, cx)
+                            });
+                        },
+                    ),
+                );
+            }
+        }
+        menu
     }
 
     fn activate_project_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3025,7 +3165,16 @@ impl Give {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .capture_any_mouse_down(cx.listener(clear_context_copy))
+                    .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        clear_context_copy(this, event, window, cx);
+                        if event.button == MouseButton::Right {
+                            this.context_catalog = this.catalog_context(None);
+                        }
+                        if event.button == MouseButton::Left {
+                            this.focus_left = true;
+                            this.focus.focus(window);
+                        }
+                    }))
                     .when(!self.tree.is_empty(), |el| {
                         el.child(
                             uniform_list(
@@ -3122,8 +3271,8 @@ impl Give {
                                                         .hover(|el| el.bg(rgb(theme::current().colors.surface)))
                                                         .on_mouse_down(
                                                             MouseButton::Right,
-                                                            cx.listener(move |this, _, _, _| {
-                                                                this.tree_context(index)
+                                                            cx.listener(move |this, _, window, cx| {
+                                                                this.tree_context(index, window, cx)
                                                             }),
                                                         )
                                                         .on_click(cx.listener(
@@ -4696,6 +4845,7 @@ impl Render for Give {
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::copy_diff))
             .on_action(cx.listener(Self::copy_path))
+            .on_action(cx.listener(Self::paste_files))
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::select_all_text))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.extend_selection(0, -1, cx)))
@@ -4846,6 +4996,7 @@ fn clear_context_copy(
 ) {
     if event.button == MouseButton::Right {
         this.context_copy = None;
+        this.context_catalog = None;
     }
 }
 
@@ -4970,6 +5121,81 @@ mod tests {
     use gpui_component::{Root, WindowExt};
     // The GPUI glob also exports a `test` macro; the generated attribute needs Rust's.
     use std::prelude::v1::test;
+
+    #[gpui::test]
+    fn catalog_menu_targets_the_clicked_row_and_rejects_other_modes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::terminal_view::init(cx);
+            crate::find_view::init(cx);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut give = Give::new(None, None, window, cx);
+            give.repo = Some(Repository { root: root.clone() });
+            give.tree_mode = TreeMode::Catalog;
+            let file = ChangedFile {
+                path: "assets/photo.png".into(),
+                directory: false,
+                original_path: None,
+                index: ' ',
+                worktree: ' ',
+            };
+            give.tree = tree::build_catalog(&[file], &HashSet::from(["assets".into()]), false);
+            give
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |give, cx| {
+                give.focus_left = false;
+                give.tree_context(1, window, cx);
+                assert_eq!(give.tree_cursor, Some(1));
+                assert!(give.focus_left);
+                assert!(
+                    give.selected.is_none(),
+                    "right-click must not open a preview"
+                );
+                let target = give.context_catalog.clone().unwrap();
+                assert_eq!(target.directory, std::path::Path::new("assets"));
+                assert_eq!(
+                    target.file.as_deref(),
+                    Some(std::path::Path::new("assets/photo.png"))
+                );
+                assert!(give.can_edit_catalog(&target));
+
+                give.tree_context(0, window, cx);
+                let folder = give.context_catalog.as_ref().unwrap();
+                assert_eq!(folder.directory, std::path::Path::new("assets"));
+                assert!(folder.file.is_none(), "folders do not offer file deletion");
+                assert!(
+                    give.catalog_context(None)
+                        .unwrap()
+                        .directory
+                        .as_os_str()
+                        .is_empty()
+                );
+
+                give.busy = true;
+                assert!(!give.can_edit_catalog(&target));
+                give.busy = false;
+                give.tree_mode = TreeMode::Changes;
+                assert!(give.catalog_context(Some(1)).is_none());
+                assert!(!give.can_edit_catalog(&target));
+                give.tree_mode = TreeMode::Catalog;
+                give.review_branch = Some("review".into());
+                assert!(give.catalog_context(Some(1)).is_none());
+                assert!(!give.can_edit_catalog(&target));
+                give.review_branch = None;
+                give.repo = Some(Repository {
+                    root: root.join("another-project"),
+                });
+                assert!(
+                    !give.can_edit_catalog(&target),
+                    "stale menu must not edit another project"
+                );
+            });
+        });
+    }
 
     #[gpui::test]
     fn project_choice_preserves_workspace_until_replacement(cx: &mut TestAppContext) {

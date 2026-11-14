@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
+    ops::Range,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -163,6 +164,8 @@ pub struct Frame {
     pub rows: usize,
     pub columns: usize,
     pub cells: Vec<Cell>,
+    /// Visible portions of paragraphs, separated by empty hard lines.
+    pub blocks: Vec<Range<usize>>,
     pub text: String,
     pub selected_text: Option<String>,
     pub cursor: Option<(usize, usize, CursorShape)>,
@@ -170,6 +173,15 @@ pub struct Frame {
     pub display_offset: usize,
     pub history: usize,
     pub exited: Option<String>,
+}
+
+impl Frame {
+    pub fn block_at(&self, row: usize) -> Option<Range<usize>> {
+        self.blocks
+            .iter()
+            .find(|block| block.contains(&row))
+            .cloned()
+    }
 }
 
 pub struct Terminal {
@@ -431,6 +443,13 @@ impl Terminal {
     pub fn selected_text(&self) -> Option<String> {
         self.state.try_lock().ok()?.term.selection_to_string()
     }
+
+    /// Snapshot the complete paragraph under a displayed row without changing
+    /// selection. Reject an outdated frame rather than copying a different block.
+    pub fn block_text(&self, row: usize, frame: &Frame) -> Option<String> {
+        let state = self.state.try_lock().ok()?;
+        block_text(&state, row, frame)
+    }
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
@@ -441,6 +460,67 @@ impl Drop for Terminal {
 
 fn frame(state: &State) -> Frame {
     frame_with_palette(state, &crate::theme::current())
+}
+
+fn block_line(term: &Term<Events>, line: Line) -> bool {
+    let wraps = |line: Line| {
+        term.grid()[line][term.last_column()]
+            .flags
+            .contains(Flags::WRAPLINE)
+    };
+    // A visually empty soft-wrapped row is still part of its logical line.
+    wraps(line)
+        || (line > term.topmost_line() && wraps(line - 1))
+        || (0..term.columns()).any(|col| {
+            let cell = &term.grid()[line][Column(col)];
+            !matches!(cell.c, ' ' | '\t')
+                && !cell.flags.intersects(
+                    Flags::HIDDEN | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
+                )
+        })
+}
+
+fn visible_blocks(term: &Term<Events>) -> Vec<Range<usize>> {
+    let mut blocks = Vec::new();
+    let mut start = None;
+    for row in 0..term.screen_lines() {
+        let line = Line(row as i32 - term.grid().display_offset() as i32);
+        if block_line(term, line) {
+            start.get_or_insert(row);
+        } else if let Some(start) = start.take() {
+            blocks.push(start..row);
+        }
+    }
+    if let Some(start) = start {
+        blocks.push(start..term.screen_lines());
+    }
+    blocks
+}
+
+fn block_text(state: &State, row: usize, frame: &Frame) -> Option<String> {
+    let term = &state.term;
+    if state.content_revision != frame.content_revision
+        || term.grid().display_offset() != frame.display_offset
+        || term.screen_lines() != frame.rows
+        || term.columns() != frame.columns
+        || term.mode().contains(Mode::ALT_SCREEN) != frame.mode.contains(Mode::ALT_SCREEN)
+    {
+        return None;
+    }
+    let visible = frame.block_at(row)?;
+    let offset = frame.display_offset as i32;
+    let mut start = Line(visible.start as i32 - offset);
+    let mut end = Line(visible.end as i32 - offset - 1);
+    while start > term.topmost_line() && block_line(term, start - 1) {
+        start -= 1;
+    }
+    while end < term.bottommost_line() && block_line(term, end + 1) {
+        end += 1;
+    }
+    Some(term.bounds_to_string(
+        Point::new(start, Column(0)),
+        Point::new(end, term.last_column()),
+    ))
 }
 
 fn frame_with_palette(state: &State, palette: &crate::theme::Theme) -> Frame {
@@ -520,6 +600,7 @@ fn frame_with_palette(state: &State, palette: &crate::theme::Theme) -> Frame {
         rows: term.screen_lines(),
         columns: term.columns(),
         cells,
+        blocks: visible_blocks(term),
         cursor,
         mode: content.mode,
         display_offset,
@@ -745,7 +826,111 @@ mod tests {
     fn parse(state: &mut State, bytes: &[u8]) {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut state.term, bytes);
+        state.content_revision += 1;
     }
+
+    #[test]
+    fn semantic_selection_keeps_cyrillic_words_whole() {
+        let (mut state, _, _) = model(4, 60);
+        parse(&mut state, "hello Привет, ёлочка hello_мир\r\n".as_bytes());
+        for (column, expected) in [
+            (2, "hello"),
+            (8, "Привет"),
+            (16, "ёлочка"),
+            (26, "hello_мир"),
+        ] {
+            state.term.selection = Some(Selection::new(
+                SelectionType::Semantic,
+                Point::new(Line(0), Column(column)),
+                Side::Left,
+            ));
+            assert_eq!(state.term.selection_to_string().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn output_blocks_follow_blank_lines_and_copy_plain_text_without_changing_selection() {
+        let (mut state, _, _) = model(12, 40);
+        parse(
+            &mut state,
+            "\r\n\x1b[32mОтвет агента\x1b[0m\r\n  - 界 e\u{301}\r\n \t \r\nnext\r\n\r\n".as_bytes(),
+        );
+        let point = Point::new(Line(4), Column(0));
+        let mut selection = Selection::new(SelectionType::Simple, point, Side::Left);
+        selection.update(Point::new(Line(4), Column(3)), Side::Right);
+        state.term.selection = Some(selection);
+        let before = state.term.selection_to_string();
+        let frame = frame(&state);
+        assert_eq!(frame.blocks, vec![1..3, 4..5]);
+        assert_eq!(frame.block_at(2), Some(1..3));
+        assert_eq!(frame.block_at(3), None);
+        assert_eq!(frame.block_at(99), None);
+        assert_eq!(
+            block_text(&state, 1, &frame).as_deref(),
+            Some("Ответ агента\n  - 界 e\u{301}")
+        );
+        assert_eq!(block_text(&state, 4, &frame).as_deref(), Some("next"));
+        assert_eq!(block_text(&state, 3, &frame), None);
+        assert_eq!(before, state.term.selection_to_string());
+    }
+
+    #[test]
+    fn output_blocks_copy_both_sides_of_viewport_and_unwrap_soft_lines() {
+        let (mut state, _, _) = model(3, 8);
+        let text = "abcdefghijk界e\u{301}lmno";
+        parse(
+            &mut state,
+            format!("before\r\n\r\n{text}\r\nsecond\r\nthird\r\n\r\nafter").as_bytes(),
+        );
+        // A middle window shows only part of the paragraph. Both its beginning
+        // and its end must be included, with hard line breaks preserved.
+        state.term.scroll_display(Scroll::Delta(2));
+        let frame = frame(&state);
+        assert_eq!(frame.blocks, vec![0..3]);
+        for row in 0..3 {
+            assert_eq!(
+                block_text(&state, row, &frame).as_deref(),
+                Some(format!("{text}\nsecond\nthird").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn output_blocks_keep_whitespace_soft_rows_and_handle_live_redraws() {
+        let (mut state, _, _) = model(8, 4);
+        parse(&mut state, b"abcd    ef\r\n\r\n10%\r90%\x1b[K");
+        let frame = frame(&state);
+        assert_eq!(frame.blocks, vec![0..3, 4..5]);
+        assert_eq!(block_text(&state, 1, &frame).as_deref(), Some("abcd    ef"));
+        assert_eq!(block_text(&state, 4, &frame).as_deref(), Some("90%"));
+        parse(&mut state, b"\x1b[2J\x1b[H");
+        assert!(super::frame(&state).blocks.is_empty());
+        assert_eq!(block_text(&state, 4, &frame), None);
+    }
+
+    #[test]
+    fn output_blocks_reject_stale_frames_and_keep_screens_separate() {
+        let (mut state, _, _) = model(3, 20);
+        parse(&mut state, b"main\r\n\r\nlast\r\n");
+        let main = frame(&state);
+        parse(&mut state, b"\x1b[?1049halternate\r\n\r\nother");
+        let alternate = frame(&state);
+        assert_eq!(alternate.blocks, vec![0..1, 2..3]);
+        assert_eq!(block_text(&state, 0, &main), None);
+        assert_eq!(
+            block_text(&state, 0, &alternate).as_deref(),
+            Some("alternate")
+        );
+        parse(&mut state, b"\x1b[?1049l");
+        assert_eq!(block_text(&state, 0, &alternate), None);
+        let main = frame(&state);
+        state.term.scroll_display(Scroll::Top);
+        assert_eq!(block_text(&state, 1, &main), None);
+        let resized = frame(&state);
+        state.term.resize(GridSize { rows: 6, cols: 30 });
+        assert_eq!(block_text(&state, 1, &resized), None);
+    }
+
     #[test]
     fn search_finds_literal_text_across_wrapped_history_without_changing_selection() {
         let (mut state, _, _) = model(2, 6);

@@ -1,11 +1,11 @@
 //! Full-file overlay ported from giv's tui/diffview.go and tui/preview.go.
 use crate::git::{Diff, DiffLine, LineKind};
 use crate::theme::SyntaxColor;
-use std::{ops::Range, path::Path, sync::LazyLock};
+use std::{collections::BTreeMap, ops::Range, path::Path, sync::LazyLock};
 use syntect::{
     easy::HighlightLines,
-    highlighting::ThemeSet,
-    parsing::{SyntaxDefinition, SyntaxSet, SyntaxSetBuilder},
+    highlighting::{HighlightState, ThemeSet},
+    parsing::{ParseState, SyntaxDefinition, SyntaxReference, SyntaxSet},
 };
 
 pub const MAX_LINES: usize = 6000;
@@ -16,82 +16,151 @@ pub struct Highlight {
     pub color: SyntaxColor,
 }
 
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_nonewlines);
-/// Grammars missing from Syntect's bundled set, kept separate so the bundled
-/// dump loads without relinking.
-static EXTRA_SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(|| {
-    let mut builder = SyntaxSetBuilder::new();
-    builder.add(
-        SyntaxDefinition::load_from_str(
+// Link the additional grammars with the bundled set so Astro can embed CSS
+// and JavaScript/TypeScript while retaining the other built-in languages.
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(|| {
+    let mut builder = SyntaxSet::load_defaults_nonewlines().into_builder();
+    for (name, source) in [
+        (
+            "Dart",
             include_str!("../assets/syntaxes/Dart.sublime-syntax"),
-            false,
-            None,
-        )
-        .expect("bundled Dart grammar"),
-    );
-    builder.add(
-        SyntaxDefinition::load_from_str(
+        ),
+        (
+            "Protocol Buffers",
             include_str!("../assets/syntaxes/Protobuf.sublime-syntax"),
-            false,
-            None,
-        )
-        .expect("bundled Protocol Buffers grammar"),
-    );
+        ),
+        (
+            "WebScript",
+            include_str!("../assets/syntaxes/WebScript.sublime-syntax"),
+        ),
+        (
+            "Astro",
+            include_str!("../assets/syntaxes/Astro.sublime-syntax"),
+        ),
+        (
+            "TOML",
+            include_str!("../assets/syntaxes/TOML.sublime-syntax"),
+        ),
+    ] {
+        builder.add(
+            SyntaxDefinition::load_from_str(source, false, None)
+                .unwrap_or_else(|error| panic!("bundled {name} grammar: {error}")),
+        );
+    }
     builder.build()
 });
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 pub fn warm_up() {
     LazyLock::force(&SYNTAXES);
-    LazyLock::force(&EXTRA_SYNTAXES);
     LazyLock::force(&THEMES);
 }
 
-/// Highlight each displayed source row, as Chroma does in giv. Byte ranges are
-/// retained so GPUI can shape the entire row without creating an element per token.
-pub fn highlight(path: &Path, lines: &[DiffLine]) -> Vec<Vec<Highlight>> {
+fn syntax_for(path: &Path) -> &'static SyntaxReference {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let extension = path.extension().unwrap_or_default().to_string_lossy();
-    let find = |set: &'static SyntaxSet| {
-        set.find_syntax_by_extension(&name)
-            .or_else(|| set.find_syntax_by_extension(&extension))
-            .map(|syntax| (syntax, set))
-    };
-    let (syntax, set) = find(&SYNTAXES)
-        .or_else(|| find(&EXTRA_SYNTAXES))
-        .unwrap_or_else(|| (SYNTAXES.find_syntax_plain_text(), &SYNTAXES));
-    lines
-        .iter()
-        .map(|line| {
-            let mut highlighter = HighlightLines::new(syntax, &THEMES.themes["base16-ocean.dark"]);
+    let extension = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    // Prefer the modern grammar to the bundled legacy JavaScript definition.
+    if matches!(
+        extension.as_str(),
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx"
+    ) {
+        return SYNTAXES
+            .find_syntax_by_name("JavaScript and TypeScript")
+            .expect("WebScript grammar");
+    }
+    if extension == "jsonc" {
+        return SYNTAXES
+            .find_syntax_by_extension("json")
+            .expect("JSON grammar");
+    }
+    SYNTAXES
+        .find_syntax_by_extension(&name)
+        .or_else(|| SYNTAXES.find_syntax_by_extension(&extension))
+        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text())
+}
+
+/// Parser checkpoints keep multiline constructs correct when visible chunks are
+/// requested out of order. Only requested rows allocate retained highlight spans.
+#[derive(Default)]
+pub(crate) struct HighlightCache {
+    states: BTreeMap<usize, (HighlightState, ParseState)>,
+}
+
+impl HighlightCache {
+    pub(crate) fn range(
+        &mut self,
+        path: &Path,
+        lines: &[DiffLine],
+        range: Range<usize>,
+        skip: Option<LineKind>,
+    ) -> Vec<Vec<Highlight>> {
+        let end = range.end.min(lines.len());
+        if range.start >= end {
+            return Vec::new();
+        }
+        let theme = &THEMES.themes["base16-ocean.dark"];
+        let (start, mut highlighter) = match self.states.range(..=range.start).next_back() {
+            Some((&index, (highlight, parse))) => (
+                index,
+                HighlightLines::from_state(theme, highlight.clone(), parse.clone()),
+            ),
+            None => (0, HighlightLines::new(syntax_for(path), theme)),
+        };
+        let mut result = Vec::with_capacity(end - range.start);
+        for (index, line) in lines.iter().enumerate().take(end).skip(start) {
             let mut offset = 0;
-            highlighter
-                .highlight_line(&line.text, set)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(style, text)| {
-                    let start = offset;
-                    offset += text.len();
-                    // Keep token roles independent from the selected color scheme.
-                    let color = match (style.foreground.r, style.foreground.g, style.foreground.b) {
-                        (101, 115, 126) => SyntaxColor::Comment, // comment
-                        (180, 142, 173) => SyntaxColor::Keyword, // keyword
-                        (163, 190, 140) => SyntaxColor::String,  // string
-                        (208, 135, 112) => SyntaxColor::Number,  // number
-                        (143, 161, 179) => SyntaxColor::Type,    // type
-                        (136, 192, 208) => SyntaxColor::Type,
-                        (191, 97, 106) => SyntaxColor::Variable,
-                        (235, 203, 139) => SyntaxColor::Function,
-                        _ => SyntaxColor::Text,
-                    };
-                    Highlight {
-                        range: start..offset,
-                        color,
-                    }
-                })
-                .collect()
-        })
-        .collect()
+            let spans = if skip == Some(line.kind)
+                || matches!(line.kind, LineKind::Header | LineKind::Hunk)
+            {
+                Vec::new()
+            } else {
+                highlighter
+                    .highlight_line(&line.text, &SYNTAXES)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(style, text)| {
+                        let start = offset;
+                        offset += text.len();
+                        let color =
+                            match (style.foreground.r, style.foreground.g, style.foreground.b) {
+                                (101, 115, 126) => SyntaxColor::Comment,
+                                (180, 142, 173) => SyntaxColor::Keyword,
+                                (163, 190, 140) => SyntaxColor::String,
+                                (208, 135, 112) => SyntaxColor::Number,
+                                (143, 161, 179) | (136, 192, 208) => SyntaxColor::Type,
+                                (191, 97, 106) => SyntaxColor::Variable,
+                                (235, 203, 139) => SyntaxColor::Function,
+                                _ => SyntaxColor::Text,
+                            };
+                        Highlight {
+                            range: start..offset,
+                            color,
+                        }
+                    })
+                    .collect()
+            };
+            if index >= range.start {
+                result.push(spans);
+            }
+            if (index + 1) % 48 == 0 {
+                let (highlight, parse) = highlighter.state();
+                self.states
+                    .insert(index + 1, (highlight.clone(), parse.clone()));
+                highlighter = HighlightLines::from_state(theme, highlight, parse);
+            }
+        }
+        result
+    }
+}
+
+/// Highlight source rows with parser state preserved between lines. Byte ranges
+/// let GPUI shape an entire row without creating a separate element per token.
+pub fn highlight(path: &Path, lines: &[DiffLine]) -> Vec<Vec<Highlight>> {
+    HighlightCache::default().range(path, lines, 0..lines.len(), None)
 }
 
 pub fn source_lines(body: &[u8]) -> Vec<String> {

@@ -5,6 +5,7 @@ mod appearance;
 mod find_view;
 mod image_view;
 mod project_launch;
+mod prompt_bar;
 mod rcli_view;
 mod settings_view;
 mod terminal_view;
@@ -104,6 +105,7 @@ actions!(
         ToggleSidebar,
         ToggleHistory,
         CopyPath,
+        PasteFiles,
         Find,
         SelectAllText,
         SelectLeft,
@@ -149,6 +151,7 @@ fn update_dock_menu(projects: &[PathBuf], cx: &App) {
 }
 
 fn main() {
+    give::panic_log::install();
     let mut initial = None;
     let mut review = None;
     let mut arguments = std::env::args_os().skip(1);
@@ -184,6 +187,11 @@ fn main() {
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([
                 KeyBinding::new("secondary-c", CopyPath, Some("Give && !Input && !Terminal")),
+                KeyBinding::new(
+                    "secondary-v",
+                    PasteFiles,
+                    Some("Give && !Input && !Terminal"),
+                ),
                 KeyBinding::new("secondary-f", Find, Some("Give && !Terminal")),
                 KeyBinding::new(
                     "secondary-a",
