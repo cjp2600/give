@@ -2518,11 +2518,11 @@ impl Give {
             return;
         }
         if let Some(target) = self.catalog_context(self.tree_cursor) {
-            self.paste_into(target, window, cx);
+            self.paste_into(target, cx);
         }
     }
 
-    fn paste_into(&mut self, target: CatalogContext, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste_into(&mut self, target: CatalogContext, cx: &mut Context<Self>) {
         if !self.can_edit_catalog(&target) {
             return;
         }
@@ -2551,34 +2551,103 @@ impl Give {
                 .filter(|path| !path.as_os_str().is_empty())
                 .map(|path| path.to_owned()),
         );
-        let repo = self.repo.clone().unwrap();
         self.start_operation("Pasting files…", cx);
-        let task = cx.background_executor().spawn(async move {
-            catalog::paste(&target.root, &target.directory, payload)?;
-            repo.snapshot_with(true)
-        });
-        self.finish_operation(task, "Files pasted", window, cx);
+        let directory = target.directory.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { catalog::paste(&target.root, &target.directory, payload) });
+        self.finish_catalog_edit(
+            task,
+            move |snapshot, pasted| {
+                for path in pasted {
+                    if let Some(name) = path.file_name() {
+                        snapshot.insert_new_file(directory.join(name));
+                    }
+                }
+            },
+            "Files pasted",
+            cx,
+        );
     }
 
-    fn delete_catalog_file(
+    /// Ask before moving a file to Trash; the menu item is easy to hit by accident.
+    fn confirm_delete_catalog_file(
         &mut self,
         target: CatalogContext,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(path) = target.file.clone() else {
+            return;
+        };
+        if !self.can_edit_catalog(&target) {
+            return;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Move “{name}” to Trash?"),
+            Some(&path.to_string_lossy()),
+            &["Move to Trash", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            if let Ok(0) = answer.await {
+                let _ = view.update(cx, |this, cx| this.delete_catalog_file(target, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn delete_catalog_file(&mut self, target: CatalogContext, cx: &mut Context<Self>) {
         if !self.can_edit_catalog(&target) {
             return;
         }
         let Some(path) = target.file else {
             return;
         };
-        let repo = self.repo.clone().unwrap();
         self.start_operation("Moving file to Trash…", cx);
-        let task = cx.background_executor().spawn(async move {
-            catalog::trash(&target.root, &path)?;
-            repo.snapshot_with(true)
-        });
-        self.finish_operation(task, "File moved to Trash", window, cx);
+        let removed = path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { catalog::trash(&target.root, &path) });
+        self.finish_catalog_edit(
+            task,
+            move |snapshot, ()| snapshot.remove_file(&removed),
+            "File moved to Trash",
+            cx,
+        );
+    }
+
+    /// Catalog edits touch only the chosen paths, so show them without waiting
+    /// for a full disk and Git scan; a background refresh then settles statuses.
+    fn finish_catalog_edit<T: 'static>(
+        &mut self,
+        task: Task<anyhow::Result<T>>,
+        apply: impl FnOnce(&mut Snapshot, T) + 'static,
+        message: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(value) => {
+                        apply(&mut this.snapshot, value);
+                        this.notice = message.into();
+                        this.rebuild_tree(false, cx);
+                    }
+                    Err(error) => this.show_error(error, cx),
+                }
+                this.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The selection with its lines when the row is inside it, otherwise that line.
@@ -2664,10 +2733,9 @@ impl Give {
             let paste_view = view.clone();
             let paste_target = target.clone();
             menu = menu.item(PopupMenuItem::new("Paste").disabled(!enabled).on_click(
-                move |_, window, cx| {
-                    let _ = paste_view.update(cx, |this, cx| {
-                        this.paste_into(paste_target.clone(), window, cx)
-                    });
+                move |_, _, cx| {
+                    let _ =
+                        paste_view.update(cx, |this, cx| this.paste_into(paste_target.clone(), cx));
                 },
             ));
             if target.file.is_some() {
@@ -2676,7 +2744,7 @@ impl Give {
                     PopupMenuItem::new("Delete").disabled(!enabled).on_click(
                         move |_, window, cx| {
                             let _ = delete_view.update(cx, |this, cx| {
-                                this.delete_catalog_file(target.clone(), window, cx)
+                                this.confirm_delete_catalog_file(target.clone(), window, cx)
                             });
                         },
                     ),

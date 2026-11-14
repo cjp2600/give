@@ -93,6 +93,40 @@ impl Snapshot {
                     .map(|i| &self.catalog[i])
             })
     }
+
+    /// Show a pasted file at once; the next scan confirms its Git status.
+    pub fn insert_new_file(&mut self, path: PathBuf) {
+        let ignored = path.ancestors().skip(1).any(|parent| {
+            self.catalog
+                .binary_search_by(|file| file.path.as_path().cmp(parent))
+                .is_ok_and(|i| self.catalog[i].ignored())
+        });
+        let status = if ignored { '!' } else { '?' };
+        let file = ChangedFile {
+            path,
+            directory: false,
+            original_path: None,
+            index: status,
+            worktree: status,
+        };
+        let insert = |files: &mut Vec<ChangedFile>, file: ChangedFile| match files
+            .binary_search_by(|other| other.path.cmp(&file.path))
+        {
+            Ok(i) => files[i] = file,
+            Err(i) => files.insert(i, file),
+        };
+        if !ignored {
+            insert(&mut self.files, file.clone());
+        }
+        insert(&mut self.catalog, file);
+    }
+
+    /// Hide a deleted file at once; the next scan confirms its Git status.
+    pub fn remove_file(&mut self, path: &Path) {
+        self.files.retain(|file| file.path != path);
+        self.catalog.retain(|file| file.path != path);
+        self.versions.remove(path);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,100 +186,101 @@ impl Repository {
     }
 
     /// With `catalog`, also reads disk entries, including ignored and hidden paths.
+    /// Git queries and the disk walk run concurrently; only ignore rules wait for both.
     pub fn snapshot_with(&self, catalog: bool) -> Result<Snapshot> {
-        let raw = run(
-            &self.root,
-            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            None,
-            false,
-        )?;
-        let branch = match run(
-            &self.root,
-            ["symbolic-ref", "--quiet", "--short", "HEAD"],
-            None,
-            false,
-        ) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).trim_end().to_owned(),
-            Err(_) => {
-                let bytes = run(&self.root, ["rev-parse", "--short", "HEAD"], None, false)?;
-                format!("detached · {}", String::from_utf8_lossy(&bytes).trim_end())
-            }
-        };
-        let files = parse_status(&raw)?;
-        let catalog = if catalog {
-            self.disk_catalog(&files)?
-        } else {
-            Vec::new()
-        };
-        let head =
-            run(&self.root, ["rev-parse", "--verify", "HEAD"], None, false).unwrap_or_default();
-        // A porcelain status can stay " M" while the file changes repeatedly.
-        // Per-file versions invalidate only that file, also when HEAD changes.
-        let versions = files
-            .iter()
-            .chain(catalog.iter().filter(|file| !file.changed()))
-            .map(|file| {
-                let mut hash = std::collections::hash_map::DefaultHasher::new();
-                head.hash(&mut hash);
-                file.index.hash(&mut hash);
-                file.worktree.hash(&mut hash);
-                if let Ok(metadata) = fs::metadata(self.root.join(&file.path)) {
-                    metadata.len().hash(&mut hash);
-                    metadata.modified().ok().hash(&mut hash);
+        thread::scope(|scope| {
+            let walk = catalog.then(|| scope.spawn(|| walk_disk(&self.root)));
+            let tracked = catalog.then(|| {
+                scope.spawn(|| run(&self.root, ["ls-files", "--cached", "-z"], None, false))
+            });
+            let branch = scope.spawn(|| self.branch());
+            let head = scope.spawn(|| {
+                run(&self.root, ["rev-parse", "--verify", "HEAD"], None, false).unwrap_or_default()
+            });
+            let raw = run(
+                &self.root,
+                ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                None,
+                false,
+            )?;
+            let files = parse_status(&raw)?;
+            let catalog = match (walk, tracked) {
+                (Some(walk), Some(tracked)) => {
+                    self.disk_catalog(&files, joined(walk)?, &joined(tracked)?)?
                 }
-                (file.path.clone(), hash.finish())
+                _ => Vec::new(),
+            };
+            let branch = joined(branch)?;
+            let head = joined(head);
+            // A porcelain status can stay " M" while the file changes repeatedly.
+            // Per-file versions invalidate only that file, also when HEAD changes.
+            let versions = files
+                .iter()
+                .chain(catalog.iter().filter(|file| !file.changed()))
+                .map(|file| (file.path.clone(), self.version(&head, file)))
+                .collect();
+            Ok(Snapshot {
+                branch,
+                files,
+                catalog,
+                versions,
             })
-            .collect();
-        Ok(Snapshot {
-            branch,
-            files,
-            catalog,
-            versions,
         })
     }
 
-    fn disk_catalog(&self, files: &[ChangedFile]) -> Result<Vec<ChangedFile>> {
+    fn branch(&self) -> Result<String> {
+        Ok(
+            match run(
+                &self.root,
+                ["symbolic-ref", "--quiet", "--short", "HEAD"],
+                None,
+                false,
+            ) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).trim_end().to_owned(),
+                Err(_) => {
+                    let bytes = run(&self.root, ["rev-parse", "--short", "HEAD"], None, false)?;
+                    format!("detached · {}", String::from_utf8_lossy(&bytes).trim_end())
+                }
+            },
+        )
+    }
+
+    fn version(&self, head: &[u8], file: &ChangedFile) -> u64 {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        head.hash(&mut hash);
+        file.index.hash(&mut hash);
+        file.worktree.hash(&mut hash);
+        if let Ok(metadata) = fs::metadata(self.root.join(&file.path)) {
+            metadata.len().hash(&mut hash);
+            metadata.modified().ok().hash(&mut hash);
+        }
+        hash.finish()
+    }
+
+    fn disk_catalog(
+        &self,
+        files: &[ChangedFile],
+        entries: Vec<(PathBuf, bool)>,
+        tracked: &[u8],
+    ) -> Result<Vec<ChangedFile>> {
         let mut catalog: HashMap<_, _> = files
             .iter()
             .map(|file| (file.path.clone(), file.clone()))
             .collect();
-        let mut pending = vec![PathBuf::new()];
-        while let Some(parent) = pending.pop() {
-            let entries = match fs::read_dir(self.root.join(&parent)) {
-                Ok(entries) => entries,
-                // A directory may disappear between enumeration and reading it.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error).context("Could not read catalog directory"),
-            };
-            for entry in entries {
-                let entry = entry?;
-                if entry.file_name() == ".git" {
-                    continue;
-                }
-                let path = parent.join(entry.file_name());
-                let directory = match entry.file_type() {
-                    Ok(kind) => kind.is_dir(),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                if directory {
-                    pending.push(path.clone());
-                }
-                // Do not follow symlinks: cycles and paths outside the project stay leaves.
-                catalog
-                    .entry(path.clone())
-                    .and_modify(|file| file.directory = directory)
-                    .or_insert(ChangedFile {
-                        path,
-                        directory,
-                        original_path: None,
-                        index: ' ',
-                        worktree: ' ',
-                    });
-            }
+        for (path, directory) in entries {
+            catalog
+                .entry(path.clone())
+                .and_modify(|file| file.directory = directory)
+                .or_insert(ChangedFile {
+                    path,
+                    directory,
+                    original_path: None,
+                    index: ' ',
+                    worktree: ' ',
+                });
         }
         if !catalog.is_empty() {
-            let tracked: HashSet<_> = run(&self.root, ["ls-files", "--cached", "-z"], None, false)?
+            let tracked: HashSet<_> = tracked
                 .split(|b| *b == 0)
                 .filter(|path| !path.is_empty())
                 .map(path_from_bytes)
@@ -559,6 +594,97 @@ impl Repository {
         )?;
         Ok(())
     }
+}
+
+fn joined<T>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Disk entries below `root` except `.git`, as (relative path, is directory).
+/// Workers share one queue of directories: build trees dominate large projects,
+/// so splitting by top-level folder would leave most threads idle.
+fn walk_disk(root: &Path) -> Result<Vec<(PathBuf, bool)>> {
+    struct Queue {
+        pending: Vec<PathBuf>,
+        active: usize,
+        error: Option<anyhow::Error>,
+    }
+    let queue = std::sync::Mutex::new(Queue {
+        pending: vec![PathBuf::new()],
+        active: 0,
+        error: None,
+    });
+    let ready = std::sync::Condvar::new();
+    let workers = thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 8));
+    let read = |parent: &Path, found: &mut Vec<(PathBuf, bool)>, subdirectories: &mut Vec<_>| {
+        let entries = match fs::read_dir(root.join(parent)) {
+            Ok(entries) => entries,
+            // A directory may disappear between enumeration and reading it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("Could not read catalog directory"),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let path = parent.join(entry.file_name());
+            // Do not follow symlinks: cycles and paths outside the project stay leaves.
+            let directory = match entry.file_type() {
+                Ok(kind) => kind.is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if directory {
+                subdirectories.push(path.clone());
+            }
+            found.push((path, directory));
+        }
+        anyhow::Ok(())
+    };
+    let results = thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = Vec::new();
+                    loop {
+                        let parent = {
+                            let mut queue = queue.lock().unwrap();
+                            loop {
+                                if queue.error.is_some() {
+                                    return found;
+                                }
+                                if let Some(parent) = queue.pending.pop() {
+                                    queue.active += 1;
+                                    break parent;
+                                }
+                                if queue.active == 0 {
+                                    return found;
+                                }
+                                queue = ready.wait(queue).unwrap();
+                            }
+                        };
+                        let mut subdirectories = Vec::new();
+                        let result = read(&parent, &mut found, &mut subdirectories);
+                        let mut queue = queue.lock().unwrap();
+                        queue.active -= 1;
+                        queue.pending.append(&mut subdirectories);
+                        if let Err(error) = result {
+                            queue.error.get_or_insert(error);
+                        }
+                        ready.notify_all();
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(joined).collect::<Vec<_>>()
+    });
+    if let Some(error) = queue.into_inner().unwrap().error {
+        return Err(error);
+    }
+    Ok(results.into_iter().flatten().collect())
 }
 
 pub fn parse_status(raw: &[u8]) -> Result<Vec<ChangedFile>> {

@@ -32,6 +32,8 @@ actions!(
         TerminalCopy,
         TerminalPaste,
         TerminalSelectAll,
+        TerminalTab,
+        TerminalBackTab,
         TerminalContextMenu,
         CloseQuickTerminal,
         TogglePrompt
@@ -55,6 +57,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-c", TerminalCopy, Some("Terminal")),
         KeyBinding::new("secondary-v", TerminalPaste, Some("Terminal")),
         KeyBinding::new("secondary-a", TerminalSelectAll, Some("Terminal")),
+        // Override Root's focus traversal while the terminal owns input.
+        KeyBinding::new("tab", TerminalTab, Some("Terminal && !Input")),
+        KeyBinding::new("shift-tab", TerminalBackTab, Some("Terminal && !Input")),
         KeyBinding::new("ctrl-shift-c", TerminalCopy, Some("Terminal")),
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
         KeyBinding::new("shift-f10", TerminalContextMenu, Some("Terminal")),
@@ -906,6 +911,23 @@ impl TerminalView {
             self.poll(cx);
         }
     }
+
+    fn send_tab(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        self.send(
+            if backwards {
+                b"\x1b[Z".to_vec()
+            } else {
+                b"\t".to_vec()
+            },
+            cx,
+        );
+        window.prevent_default();
+        cx.stop_propagation();
+    }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) {
             return;
@@ -1374,6 +1396,12 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(|this, _: &TerminalTab, window, cx| {
+                this.send_tab(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalBackTab, window, cx| {
+                this.send_tab(true, window, cx);
+            }))
             .on_action(cx.listener(Self::keyboard_context_menu))
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::toggle_prompt))
@@ -1986,6 +2014,145 @@ mod tests {
     use super::*;
     use gpui_component::Root;
     use std::prelude::v1::test;
+
+    struct TerminalHost(Entity<TerminalView>);
+
+    impl Render for TerminalHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.0.clone())
+                .children(Root::render_dialog_layer(window, cx))
+        }
+    }
+
+    #[gpui::test]
+    fn tab_reaches_main_terminal_pty(cx: &mut TestAppContext) {
+        exercise_terminal_tab(cx, false);
+    }
+
+    #[gpui::test]
+    fn tab_reaches_quick_terminal_pty(cx: &mut TestAppContext) {
+        exercise_terminal_tab(cx, true);
+    }
+
+    fn exercise_terminal_tab(cx: &mut TestAppContext, quick: bool) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+            crate::find_view::init(cx);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let terminal_size = Size {
+            rows: 8,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 160,
+        };
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "stty raw -echo; printf 'READY\\r\\n'; bytes=$(dd bs=1 count=4 2>/dev/null | od -An -tu1); printf 'KEYS:%s:END\\r\\n' \"$bytes\"; exec /bin/sleep 30",
+        ]);
+        let terminal = Terminal::spawn_command(directory.path(), terminal_size, command).unwrap();
+        let started = Instant::now();
+        let frame = loop {
+            if let Some(frame) = terminal.frame()
+                && frame.text.contains("READY")
+            {
+                break frame;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut input_view = None;
+        let mut owner_view = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut this = TerminalView::new(directory.path().to_owned(), window, cx);
+                this.generation += 1;
+                this.active = false;
+                this.is_quick = quick;
+                this.terminal = Some(terminal);
+                this.frame = Some(Arc::new(frame));
+                this.size = terminal_size;
+                this
+            });
+            input_view = Some(input.clone());
+            let content = if quick {
+                let owner = cx.new(|cx| {
+                    let mut this = TerminalView::new(directory.path().to_owned(), window, cx);
+                    this.generation += 1;
+                    this.active = false;
+                    this.quick_terminal = Some(input);
+                    this
+                });
+                owner_view = Some(owner.clone());
+                owner
+            } else {
+                input
+            };
+            let host = cx.new(|_| TerminalHost(content));
+            Root::new(host, window, cx)
+        });
+        let input = input_view.unwrap();
+        cx.update(|window, cx| {
+            if let Some(owner) = &owner_view {
+                owner.update(cx, |owner, cx| owner.open_quick_terminal(window, cx));
+            } else {
+                input.read(cx).focus.focus(window);
+            }
+        });
+        cx.refresh().unwrap();
+        if quick {
+            assert!(cx.debug_bounds("quick-terminal-content").is_some());
+        }
+        cx.update(|window, cx| {
+            assert!(
+                input.read(cx).focus.is_focused(window),
+                "the test terminal must own focus before typing"
+            )
+        });
+        cx.simulate_keystrokes("tab shift-tab");
+        // Flush a short read even if the UI swallowed a key. Channel ordering
+        // ensures the probe receives actual key bytes before these sentinels.
+        input.read_with(cx, |input, _| {
+            input.terminal.as_ref().unwrap().write(vec![0; 4])
+        });
+        let started = Instant::now();
+        let bytes = loop {
+            let text = input.read_with(cx, |input, _| {
+                input
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .frame()
+                    .map(|frame| frame.text)
+            });
+            if let Some(text) = text
+                && let Some(rest) = text.split("KEYS:").nth(1)
+                && let Some((bytes, _)) = rest.split_once(":END")
+            {
+                break bytes
+                    .split_whitespace()
+                    .map(|byte| byte.parse::<u8>().unwrap())
+                    .collect::<Vec<_>>();
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            bytes,
+            b"\t\x1b[Z",
+            "Tab and Shift+Tab must reach the PTY in {}",
+            if quick {
+                "Quick terminal"
+            } else {
+                "the main terminal"
+            }
+        );
+        cx.update(|window, cx| assert!(input.read(cx).focus.is_focused(window)));
+    }
 
     #[gpui::test]
     fn block_menu_copies_snapshot_and_restores_focus(cx: &mut TestAppContext) {
