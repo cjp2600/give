@@ -42,6 +42,8 @@ Hover over terminal output to softly highlight a block of text. Empty lines sepa
 
 Use **Shift+F10** to open the menu at the terminal cursor. When a terminal program handles mouse input, hold **Shift** while hovering or right-clicking to use give's block controls.
 
+On macOS, **Read block** copies the same block and sends `voicereader://read-clipboard` to **VoiceReader**. VoiceReader starts if needed and reads the clipboard explicitly, independent of its hotkey or current text selection. This requires the updated VoiceReader with the URL handler. The menu closes before the request is sent; give stays in front.
+
 ### A second shell, when you need it
 
 Click the terminal icon in the shell header to open **Quick terminal**. Run a test, check a command, or inspect a file while your main process continues. Close the modal with **×**, **⌘W**, or a click outside to return to the main terminal.

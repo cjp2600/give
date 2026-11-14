@@ -218,7 +218,12 @@ impl Terminal {
         Self::spawn_command(path, size, command)
     }
 
-    fn spawn_command(path: &Path, mut size: PtySize, mut command: CommandBuilder) -> Result<Self> {
+    /// Start a specific program on a PTY without loading a login shell.
+    pub fn spawn_command(
+        path: &Path,
+        mut size: PtySize,
+        mut command: CommandBuilder,
+    ) -> Result<Self> {
         size.rows = size.rows.max(1);
         size.cols = size.cols.max(2);
         command.cwd(path);

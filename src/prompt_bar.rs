@@ -478,9 +478,16 @@ mod tests {
             Root::new(view, window, cx)
         });
         let bar = bar.unwrap();
-        for (text, expected) in [("hello world", "hello"), ("Привет сосед", "Привет")]
-        {
+        for (text, expected) in [
+            ("hello world", "hello"),
+            ("Привет сосед", "Привет"),
+            ("Привет, сосед", "Привет"),
+            ("ёлочка рядом", "ёлочка"),
+            ("hello_мир42 конец", "hello_мир42"),
+            ("café fin", "café"),
+        ] {
             cx.update(|window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string("no selection".into()));
                 bar.update(cx, |bar, cx| {
                     bar.input
                         .update(cx, |input, cx| input.set_value(text, window, cx));

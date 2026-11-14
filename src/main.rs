@@ -10,6 +10,7 @@ mod rcli_view;
 mod settings_view;
 mod terminal_view;
 mod ui;
+mod voice_reader;
 
 use gpui::{actions, prelude::*, *};
 use gpui_component::Root;

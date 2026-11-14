@@ -14,6 +14,7 @@ use gpui_component::{
     Sizable, WindowExt,
     button::{Button, ButtonVariants},
     menu::{PopupMenu, PopupMenuItem},
+    notification::Notification,
 };
 use std::{
     cell::Cell,
@@ -124,6 +125,7 @@ pub struct TerminalView {
     mouse_button: Option<u8>,
     hovered: Option<(Point<Pixels>, bool)>,
     context_menu: Option<TerminalMenu>,
+    read_task: Option<Task<()>>,
     wheel: f32,
     preedit: String,
     preedit_selection: Range<usize>,
@@ -228,6 +230,7 @@ impl TerminalView {
             mouse_button: None,
             hovered: None,
             context_menu: None,
+            read_task: None,
             wheel: 0.,
             preedit: String::new(),
             preedit_selection: 0..0,
@@ -287,6 +290,7 @@ impl TerminalView {
         self.frame = None;
         self.hovered = None;
         self.context_menu = None;
+        self.read_task = None;
         self.error = None;
         self.revision = 0;
         let path = self.path.clone();
@@ -996,6 +1000,8 @@ impl TerminalView {
         let display_offset = frame.map_or(0, |frame| frame.display_offset);
         let selection = self.terminal.as_ref().and_then(Terminal::selected_text);
         let focus = self.focus.clone();
+        let read_text = text.clone();
+        let read_view = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, _, _| {
             menu.action_context(focus)
                 .item(
@@ -1007,6 +1013,19 @@ impl TerminalView {
                             }
                         }),
                 )
+                .when(cfg!(target_os = "macos"), |menu| {
+                    menu.item(
+                        PopupMenuItem::new("Read block")
+                            .disabled(read_text.is_none())
+                            .on_click(move |_, window, cx| {
+                                if let Some(text) = &read_text {
+                                    let _ = read_view.update(cx, |this, cx| {
+                                        this.read_block(text.clone(), window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                })
                 .item(
                     PopupMenuItem::new("Copy selection")
                         .disabled(selection.is_none())
@@ -1035,6 +1054,29 @@ impl TerminalView {
             _subscription: subscription,
         });
         cx.notify();
+    }
+
+    fn read_block(&mut self, text: String, window: &Window, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        // Let the menu dismiss before asking VoiceReader to read this clipboard.
+        // A newer request cancels this one.
+        self.read_task = Some(cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            #[cfg(not(test))]
+            let result = cx
+                .background_executor()
+                .spawn(async { crate::voice_reader::read_clipboard() })
+                .await;
+            #[cfg(test)]
+            let result = crate::voice_reader::read_clipboard();
+            let _ = view.update_in(cx, |_, window, cx| {
+                if let Err(message) = result {
+                    window.push_notification(Notification::error(message).autohide(false), cx);
+                }
+            });
+        }));
     }
 
     fn keyboard_context_menu(
@@ -1947,6 +1989,17 @@ mod tests {
 
     #[gpui::test]
     fn block_menu_copies_snapshot_and_restores_focus(cx: &mut TestAppContext) {
+        exercise_block_menu(cx, false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn read_block_copies_snapshot_before_invoking_reader(cx: &mut TestAppContext) {
+        exercise_block_menu(cx, true);
+    }
+
+    fn exercise_block_menu(cx: &mut TestAppContext, read: bool) {
+        let requests = crate::voice_reader::requests();
         cx.update(|cx| {
             gpui_component::init(cx);
             init(cx);
@@ -1959,11 +2012,12 @@ mod tests {
             pixel_width: 640,
             pixel_height: 160,
         };
-        let terminal = Terminal::spawn(directory.path(), terminal_size).unwrap();
-        terminal.write(
-            "printf '\\033[2J\\033[3J\\033[Hfirst Привет\\r\\nsecond\\r\\n\\r\\nlast\\r\\n'; exec /bin/sleep 30\r"
-                .as_bytes().to_vec(),
-        );
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'first Привет\\r\\nsecond\\r\\n\\r\\nlast\\r\\n'; exec /bin/sleep 30",
+        ]);
+        let terminal = Terminal::spawn_command(directory.path(), terminal_size, command).unwrap();
         let started = Instant::now();
         let frame = loop {
             if let Some(frame) = terminal.frame()
@@ -2069,7 +2123,11 @@ mod tests {
         });
         let view = view.unwrap();
         cx.refresh().unwrap();
-        cx.simulate_keystrokes("down enter");
+        cx.simulate_keystrokes(if read {
+            "down down enter"
+        } else {
+            "down enter"
+        });
         cx.run_until_parked();
         cx.update(|window, cx| {
             assert_eq!(
@@ -2081,6 +2139,33 @@ mod tests {
                 assert!(this.focus.is_focused(window));
             });
         });
+        assert_eq!(crate::voice_reader::requests(), requests);
+        if read {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            cx.run_until_parked();
+            assert_eq!(crate::voice_reader::requests(), requests + 1);
+            // Replacing a pending request must not fire the reader twice.
+            cx.update(|window, cx| {
+                view.update(cx, |this, cx| {
+                    this.read_block("older block".into(), window, cx);
+                    this.read_block("newer block".into(), window, cx);
+                });
+            });
+            cx.run_until_parked();
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            cx.run_until_parked();
+            assert_eq!(crate::voice_reader::requests(), requests + 2);
+            cx.update(|_, cx| {
+                assert_eq!(
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
+                    Some("newer block")
+                );
+            });
+        }
         cx.simulate_keystrokes("shift-f10");
         view.read_with(cx, |this, _| assert!(this.context_menu.is_some()));
         cx.simulate_keystrokes("escape");
